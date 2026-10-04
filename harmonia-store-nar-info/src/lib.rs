@@ -15,7 +15,7 @@ use harmonia_store_path::{StoreDir, StorePath};
 use harmonia_store_path_info::{
     NarHash, StorePathKeyed, UnkeyedValidPathInfo, ValidPathInfo, fingerprint_path,
 };
-use harmonia_utils_hash::{Hash, fmt::Base32};
+use harmonia_utils_hash::{Hash, fmt::Any};
 use harmonia_utils_signature::{SecretKey, Signature};
 
 /// A keyed NarInfo: store path plus narinfo metadata.
@@ -208,10 +208,11 @@ pub fn parse_narinfo_txt(store_dir: &StoreDir, s: &str) -> Result<NarInfo, NarIn
             }
             "URL" => url = Some(value.to_owned()),
             "Compression" => compression = Some(value.to_owned()),
+            // Nix accepts any encoding here, and Cachix writes base16.
             "FileHash" => {
                 download_hash = Some(
                     value
-                        .parse::<Base32<Hash>>()
+                        .parse::<Any<Hash>>()
                         .map_err(|e| invalid("FileHash", &e))?
                         .into_hash(),
                 );
@@ -222,7 +223,7 @@ pub fn parse_narinfo_txt(store_dir: &StoreDir, s: &str) -> Result<NarInfo, NarIn
             "NarHash" => {
                 nar_hash = Some(
                     value
-                        .parse::<Base32<NarHash>>()
+                        .parse::<Any<NarHash>>()
                         .map_err(|e| invalid("NarHash", &e))?
                         .into_hash(),
                 );
@@ -500,6 +501,31 @@ NarSize: 196040
         assert_eq!(
             parsed.path.to_string(),
             "55xkmqns51sw7nrgykp5vnz36w4fr3cw-nix-2.1.3"
+        );
+    }
+
+    #[test]
+    fn test_parse_base16_hashes() {
+        use harmonia_utils_hash::HashView;
+        // As Cachix writes them
+        let store_dir = StoreDir::default();
+        let text = "StorePath: /nix/store/55xkmqns51sw7nrgykp5vnz36w4fr3cw-nix-2.1.3
+URL: nar/abc.nar.zst
+Compression: zstd
+FileHash: sha256:be525f3848e90209632028031caefe7c9c921a01f75d22ffd70659b0b8903bd9
+FileSize: 12345
+NarHash: sha256:5b8e5e4b2e4ec0e4f1dbd7d0e05f0e7ed0b4c0b67c1bd1e6c1d7c8f04b5aa9a6
+NarSize: 196040
+";
+        let parsed = parse_narinfo_txt(&store_dir, text).unwrap();
+        let hex = |hash: &[u8]| hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(
+            hex(parsed.info.download_hash.unwrap().digest_bytes()),
+            "be525f3848e90209632028031caefe7c9c921a01f75d22ffd70659b0b8903bd9"
+        );
+        assert_eq!(
+            hex(parsed.info.info.nar_hash.digest_bytes()),
+            "5b8e5e4b2e4ec0e4f1dbd7d0e05f0e7ed0b4c0b67c1bd1e6c1d7c8f04b5aa9a6"
         );
     }
 
