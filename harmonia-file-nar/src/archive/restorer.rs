@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -178,8 +178,17 @@ impl NarRestorer {
                     name
                 };
 
+                // `name` is a slice of the parser's read buffer, and the
+                // parser can't reuse that buffer while the slice lives. The
+                // path goes on `self.path` instead, where read errors find
+                // it, so this arm can drop `name` before reading the file.
+                let dir_len = self.path.as_os_str().len();
+                if !name.is_empty() {
+                    self.path.push(OsStr::from_bytes(&name));
+                }
+                drop(name);
                 writer
-                    .send(Op::CreateFile(join_name(&self.path, &name), executable))
+                    .send(Op::CreateFile(self.path.clone(), executable))
                     .await?;
                 let mut left = size;
                 loop {
@@ -191,9 +200,7 @@ impl NarRestorer {
                         .take(FILE_CHUNK_SIZE as u64)
                         .read_to_end(&mut chunk)
                         .await
-                        .map_err(|err| {
-                            NarWriteError::create_file_error(join_name(&self.path, &name), err)
-                        })?;
+                        .map_err(|err| NarWriteError::create_file_error(self.path.clone(), err))?;
                     left = left.saturating_sub(chunk.len() as u64);
                     let last = chunk.len() < FILE_CHUNK_SIZE;
                     if !chunk.is_empty() {
@@ -212,6 +219,7 @@ impl NarRestorer {
                         break;
                     }
                 }
+                truncate_path(&mut self.path, dir_len);
             }
             NarEvent::Symlink { name, target } => {
                 let name = if self.use_case_hack {
@@ -318,6 +326,14 @@ fn join_name(dir: &Path, name: &[u8]) -> PathBuf {
         path.push(OsStr::from_bytes(name));
     }
     path
+}
+
+/// Cuts `path` back to its first `len` bytes. Unlike [`PathBuf::pop`], it
+/// doesn't parse the path.
+fn truncate_path(path: &mut PathBuf, len: usize) {
+    let mut bytes = std::mem::take(path).into_os_string().into_vec();
+    bytes.truncate(len);
+    *path = OsString::from_vec(bytes).into();
 }
 
 /// How many entries the writer thread's queue holds.
@@ -876,6 +892,38 @@ mod unittests {
             .unwrap_err();
         assert_eq!(err.operation, NarWriteOperation::CreateFile);
         assert_eq!(err.path.as_os_str(), path.join("f").as_os_str());
+    }
+
+    /// `restore` drops a file's name before it reads the file, so that the
+    /// parser can reuse the read buffer the name points into.
+    #[tokio::test]
+    async fn test_restore_drops_name_before_reading() {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        let owner: Arc<[u8]> = Arc::from(&b"f"[..]);
+        let name = Bytes::from_owner(owner.clone());
+        let reader = tokio_util::io::StreamReader::new(iter(std::iter::once_with(move || {
+            assert_eq!(Arc::strong_count(&owner), 1, "the name is still alive");
+            Ok::<_, io::Error>(Bytes::from_static(b"x"))
+        })));
+        let events = [
+            NarEvent::StartDirectory { name: Bytes::new() },
+            NarEvent::File {
+                name,
+                executable: false,
+                size: 1,
+                reader,
+            },
+            NarEvent::EndDirectory,
+        ];
+        // The case hack, on by default on macOS, keeps every name until its
+        // directory ends.
+        RestoreOptions::new()
+            .use_case_hack(false)
+            .restore(iter(events).map(Ok::<_, NarWriteError>), &path)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(path.join("f")).unwrap(), b"x");
     }
 
     #[test]
