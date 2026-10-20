@@ -1319,6 +1319,7 @@ dependencies = [
  "harmonia-store-content-address",
  "harmonia-store-path",
  "harmonia-store-path-info",
+ "harmonia-utils-base-encoding",
  "harmonia-utils-hash",
  "harmonia-utils-signature",
  "harmonia-utils-test",

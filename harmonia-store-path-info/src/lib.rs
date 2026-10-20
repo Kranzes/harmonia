@@ -11,6 +11,7 @@ mod nar_hash;
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::num::NonZero;
 
 #[cfg(any(test, feature = "test"))]
@@ -20,8 +21,8 @@ use serde::{Deserialize, Serialize, Serializer};
 pub use nar_hash::NarHash;
 
 use harmonia_store_content_address::ContentAddress;
-use harmonia_store_path::{StoreDir, StorePath};
-use harmonia_utils_hash::HashFormat as _;
+use harmonia_store_path::{StoreDir, StorePath, StorePathHash};
+use harmonia_utils_base_encoding::base32;
 use harmonia_utils_signature::Signature;
 #[cfg(any(test, feature = "test"))]
 use harmonia_utils_signature::proptests::arb_signatures;
@@ -44,53 +45,51 @@ pub fn fingerprint_path(
     nar_size: u64,
     references: &BTreeSet<StorePath>,
 ) -> Vec<u8> {
-    let nar_hash_str = format!("{}", nar_hash.as_base32());
-    let nar_hash_bytes = nar_hash_str.as_bytes();
-    let nar_size_str = nar_size.to_string();
-    let nar_size_bytes = nar_size_str.as_bytes();
+    const NAR_HASH_PREFIX: &[u8] = b"sha256:";
+    let store_dir = store_dir.to_str().as_bytes();
+    // Length of `<store-dir>/<hash>-<name>`.
+    let path_len = |path: &StorePath| {
+        store_dir.len() + 1 + StorePathHash::encoded_len() + 1 + path.name().len()
+    };
+    let nar_hash_len = base32::encode_len(nar_hash.digest_bytes().len());
+    let nar_size_len = nar_size.checked_ilog10().unwrap_or(0) as usize + 1;
+    let len = 2 // "1;"
+        + path_len(store_path) + 1
+        + NAR_HASH_PREFIX.len() + nar_hash_len + 1
+        + nar_size_len + 1
+        + references.iter().map(path_len).sum::<usize>()
+        + references.len().saturating_sub(1); // commas between references
 
-    // Construct full store path string using StoreDir's display functionality
-    let store_path_str = format!("{}", store_dir.display(store_path));
-    let store_path_bytes = store_path_str.as_bytes();
-
-    // Calculate capacity
-    let fixed_len = 2 + // "1;"
-        store_path_bytes.len() + 1 + // store path + ";"
-        nar_hash_bytes.len() + 1 + // nar hash + ";"
-        nar_size_bytes.len() + 1; // nar size + ";"
-
-    let refs_len = if references.is_empty() {
-        0
-    } else {
-        // Each reference formatted with store_dir
-        references
-            .iter()
-            .map(|r| format!("{}", store_dir.display(r)).len())
-            .sum::<usize>()
-            + references.len().saturating_sub(1) // commas between refs
+    // Pushing the paths and hashes takes half the instructions of `write!`ing
+    // them through `Display`, even into this same buffer.
+    let mut out = Vec::with_capacity(len);
+    let push_base32 = |out: &mut Vec<u8>, bytes: &[u8]| {
+        let start = out.len();
+        out.resize(start + base32::encode_len(bytes.len()), 0);
+        base32::encode_mut(bytes, &mut out[start..]);
+    };
+    let push_path = |out: &mut Vec<u8>, path: &StorePath| {
+        out.extend_from_slice(store_dir);
+        out.push(b'/');
+        push_base32(out, path.hash().as_ref());
+        out.push(b'-');
+        out.extend_from_slice(path.name().as_bytes());
     };
 
-    let mut result = Vec::with_capacity(fixed_len + refs_len);
-
-    // Add fixed parts
-    result.extend_from_slice(b"1;");
-    result.extend_from_slice(store_path_bytes);
-    result.push(b';');
-    result.extend_from_slice(nar_hash_bytes);
-    result.push(b';');
-    result.extend_from_slice(nar_size_bytes);
-    result.push(b';');
-
-    // Add references (comma-separated)
+    out.extend_from_slice(b"1;");
+    push_path(&mut out, store_path);
+    out.push(b';');
+    out.extend_from_slice(NAR_HASH_PREFIX);
+    push_base32(&mut out, nar_hash.digest_bytes());
+    write!(out, ";{nar_size};").expect("writing to a Vec cannot fail");
     for (i, reference) in references.iter().enumerate() {
         if i > 0 {
-            result.push(b',');
+            out.push(b',');
         }
-        let ref_str = format!("{}", store_dir.display(reference));
-        result.extend_from_slice(ref_str.as_bytes());
+        push_path(&mut out, reference);
     }
-
-    result
+    debug_assert_eq!(out.len(), len);
+    out
 }
 
 /// Serializes in "pure" format, omitting impure fields when they have default values.
@@ -295,7 +294,53 @@ impl<'de> Deserialize<'de> for Pure<UnkeyedValidPathInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harmonia_utils_hash::HashFormat as _;
     use harmonia_utils_hash::fmt::Base32;
+    use proptest::collection::btree_set;
+    use proptest::prelude::*;
+
+    /// Builds the fingerprint through `Display`, the way `fingerprint_path`
+    /// did before. The proptest compares the two because signatures cover
+    /// these bytes.
+    fn fingerprint_path_reference(
+        store_dir: &StoreDir,
+        store_path: &StorePath,
+        nar_hash: &NarHash,
+        nar_size: u64,
+        references: &BTreeSet<StorePath>,
+    ) -> Vec<u8> {
+        let references: Vec<String> = references
+            .iter()
+            .map(|r| store_dir.display(r).to_string())
+            .collect();
+        format!(
+            "1;{};{};{nar_size};{}",
+            store_dir.display(store_path),
+            nar_hash.as_base32(),
+            references.join(",")
+        )
+        .into_bytes()
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_fingerprint_path_matches_reference(
+            store_dir in any::<StoreDir>(),
+            store_path in any::<StorePath>(),
+            nar_hash in any::<NarHash>(),
+            nar_size in any::<u64>(),
+            // `any::<u64>()` gives mostly 20-digit sizes. Shifting covers every
+            // digit count.
+            shift in 0..u64::BITS,
+            references in btree_set(any::<StorePath>(), 0..30),
+        ) {
+            let nar_size = nar_size >> shift;
+            prop_assert_eq!(
+                fingerprint_path(&store_dir, &store_path, &nar_hash, nar_size, &references),
+                fingerprint_path_reference(&store_dir, &store_path, &nar_hash, nar_size, &references)
+            );
+        }
+    }
 
     #[test]
     fn test_fingerprint_path() {
@@ -312,6 +357,10 @@ mod tests {
         );
         let fingerprint = fingerprint_path(&store_dir, &store_path, &nar_hash, 196040, &references);
         let expected = b"1;/nix/store/syd87l2rxw8cbsxmxl853h0r6pdwhwjr-curl-7.82.0-bin;sha256:1b4sb93wp679q4zx9k1ignby1yna3z7c4c2ri3wphylbc2dwsys0;196040;/nix/store/0jqd0rlxzra1rs38rdxl43yh6rxchgc6-curl-7.82.0";
+        assert_eq!(fingerprint, expected);
+
+        let fingerprint = fingerprint_path(&store_dir, &store_path, &nar_hash, 0, &BTreeSet::new());
+        let expected = b"1;/nix/store/syd87l2rxw8cbsxmxl853h0r6pdwhwjr-curl-7.82.0-bin;sha256:1b4sb93wp679q4zx9k1ignby1yna3z7c4c2ri3wphylbc2dwsys0;0;";
         assert_eq!(fingerprint, expected);
     }
 }
