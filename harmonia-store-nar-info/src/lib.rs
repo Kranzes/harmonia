@@ -80,77 +80,84 @@ pub fn build_narinfo(
     }
 }
 
-/// Helper macro for adding lines to narinfo
-macro_rules! push_line {
-    ($buf:expr, $prefix:literal, $value:expr) => {
-        $buf.extend_from_slice($prefix);
-        $buf.extend_from_slice($value);
-        $buf.push(b'\n');
-    };
-}
-
 /// Format a `NarInfo` as the textual narinfo format used by the binary cache protocol.
 pub fn format_narinfo_txt(store_dir: &StoreDir, narinfo: &NarInfo) -> Vec<u8> {
-    use harmonia_utils_hash::HashFormat as _;
+    let mut out = String::with_capacity(narinfo_txt_capacity(store_dir, narinfo));
+    write_narinfo_txt(&mut out, store_dir, narinfo).expect("writing to a String cannot fail");
+    out.into_bytes()
+}
 
-    let path = &narinfo.path;
+/// Returns an upper bound on the length of the narinfo text, so that
+/// `format_narinfo_txt` allocates once.
+fn narinfo_txt_capacity(store_dir: &StoreDir, narinfo: &NarInfo) -> usize {
     let ni = &narinfo.info;
     let pi = &ni.info;
+    // A path takes a separator, the hash, a dash and its name.
+    let path_len =
+        |p: &StorePath| harmonia_store_path::StorePathHash::encoded_len() + 2 + p.name().len();
+    // A Sig line is `Sig: `, the key name, a colon, the base64 signature and
+    // a newline.
+    let sig_len = |s: &Signature| {
+        7 + harmonia_utils_signature::SIGNATURE_BYTES.div_ceil(3) * 4 + s.key_name.len()
+    };
+    // Everything not counted below takes at most 431 bytes, with SHA-512
+    // hashes. 512 rounds that up.
+    512 + store_dir.to_str().len()
+        + path_len(&narinfo.path)
+        + ni.url.as_ref().map_or(0, String::len)
+        + ni.compression.as_ref().map_or(0, String::len)
+        + pi.references.iter().map(path_len).sum::<usize>()
+        + pi.deriver.as_ref().map_or(0, path_len)
+        + pi.signatures.iter().map(sig_len).sum::<usize>()
+}
 
-    let nar_hash_obj: Hash = pi.nar_hash.into();
-    let nar_hash_str = format!("{}", nar_hash_obj.as_base32());
-    let nar_size_str = pi.nar_size.to_string();
+fn write_narinfo_txt(
+    out: &mut String,
+    store_dir: &StoreDir,
+    narinfo: &NarInfo,
+) -> std::fmt::Result {
+    use harmonia_utils_hash::HashFormat as _;
+    use std::fmt::Write as _;
 
-    let store_path_display = store_dir.display(path).to_string();
-
-    let mut result = Vec::new();
-
-    let file_hash_str = ni
-        .download_hash
-        .map(|h| format!("{}", h.as_base32()))
-        .unwrap_or_else(|| nar_hash_str.clone());
-    let file_size_str = ni
-        .download_size
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| nar_size_str.clone());
-
-    let url = ni.url.as_deref().unwrap_or("");
-    let compression = ni.compression.as_deref().unwrap_or("none");
+    let ni = &narinfo.info;
+    let pi = &ni.info;
+    let nar_hash = Hash::from(pi.nar_hash);
 
     // Required fields
-    push_line!(result, b"StorePath: ", store_path_display.as_bytes());
-    push_line!(result, b"URL: ", url.as_bytes());
-    push_line!(result, b"Compression: ", compression.as_bytes());
-    push_line!(result, b"FileHash: ", file_hash_str.as_bytes());
-    push_line!(result, b"FileSize: ", file_size_str.as_bytes());
-    push_line!(result, b"NarHash: ", nar_hash_str.as_bytes());
-    push_line!(result, b"NarSize: ", nar_size_str.as_bytes());
+    writeln!(out, "StorePath: {}", store_dir.display(&narinfo.path))?;
+    writeln!(out, "URL: {}", ni.url.as_deref().unwrap_or(""))?;
+    let compression = ni.compression.as_deref().unwrap_or("none");
+    writeln!(out, "Compression: {compression}")?;
+    let file_hash = ni.download_hash.unwrap_or(nar_hash);
+    writeln!(out, "FileHash: {}", file_hash.as_base32())?;
+    writeln!(out, "FileSize: {}", ni.download_size.unwrap_or(pi.nar_size))?;
+    writeln!(out, "NarHash: {}", nar_hash.as_base32())?;
+    writeln!(out, "NarSize: {}", pi.nar_size)?;
 
     // References
     if !pi.references.is_empty() {
-        result.extend_from_slice(b"References:");
+        out.push_str("References:");
         for r in &pi.references {
-            result.push(b' ');
-            result.extend_from_slice(r.to_string().as_bytes());
+            write!(out, " {r}")?;
         }
-        result.push(b'\n');
+        out.push('\n');
     }
 
     // Optional fields
     if let Some(drv) = &pi.deriver {
-        push_line!(result, b"Deriver: ", drv.to_string().as_bytes());
+        writeln!(out, "Deriver: {drv}")?;
     }
 
     // All signatures (DB sigs + cache signing key sigs).
     for sig in &pi.signatures {
-        push_line!(result, b"Sig: ", sig.to_string().as_bytes());
+        writeln!(out, "Sig: {sig}")?;
     }
 
     if let Some(ca) = &pi.ca {
-        push_line!(result, b"CA: ", ca.to_string().as_bytes());
+        writeln!(out, "CA: {ca}")?;
     }
 
-    result
+    Ok(())
 }
 
 /// Errors from parsing the textual narinfo format.
@@ -447,6 +454,148 @@ mod tests {
         assert!(lines[5].starts_with("NarHash: sha256:"));
         assert_eq!(lines[6], "NarSize: 1234");
         assert_eq!(lines.len(), 7);
+    }
+
+    /// The old `format_narinfo_txt`, kept to check that the new one writes the
+    /// same bytes.
+    fn format_narinfo_txt_reference(store_dir: &StoreDir, narinfo: &NarInfo) -> Vec<u8> {
+        use harmonia_utils_hash::HashFormat as _;
+
+        macro_rules! push_line {
+            ($buf:expr, $prefix:literal, $value:expr) => {
+                $buf.extend_from_slice($prefix);
+                $buf.extend_from_slice($value);
+                $buf.push(b'\n');
+            };
+        }
+
+        let path = &narinfo.path;
+        let ni = &narinfo.info;
+        let pi = &ni.info;
+
+        let nar_hash_obj: Hash = pi.nar_hash.into();
+        let nar_hash_str = format!("{}", nar_hash_obj.as_base32());
+        let nar_size_str = pi.nar_size.to_string();
+
+        let store_path_display = store_dir.display(path).to_string();
+
+        let mut result = Vec::new();
+
+        let file_hash_str = ni
+            .download_hash
+            .map(|h| format!("{}", h.as_base32()))
+            .unwrap_or_else(|| nar_hash_str.clone());
+        let file_size_str = ni
+            .download_size
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| nar_size_str.clone());
+
+        let url = ni.url.as_deref().unwrap_or("");
+        let compression = ni.compression.as_deref().unwrap_or("none");
+
+        push_line!(result, b"StorePath: ", store_path_display.as_bytes());
+        push_line!(result, b"URL: ", url.as_bytes());
+        push_line!(result, b"Compression: ", compression.as_bytes());
+        push_line!(result, b"FileHash: ", file_hash_str.as_bytes());
+        push_line!(result, b"FileSize: ", file_size_str.as_bytes());
+        push_line!(result, b"NarHash: ", nar_hash_str.as_bytes());
+        push_line!(result, b"NarSize: ", nar_size_str.as_bytes());
+
+        if !pi.references.is_empty() {
+            result.extend_from_slice(b"References:");
+            for r in &pi.references {
+                result.push(b' ');
+                result.extend_from_slice(r.to_string().as_bytes());
+            }
+            result.push(b'\n');
+        }
+
+        if let Some(drv) = &pi.deriver {
+            push_line!(result, b"Deriver: ", drv.to_string().as_bytes());
+        }
+
+        for sig in &pi.signatures {
+            push_line!(result, b"Sig: ", sig.to_string().as_bytes());
+        }
+
+        if let Some(ca) = &pi.ca {
+            push_line!(result, b"CA: ", ca.to_string().as_bytes());
+        }
+
+        result
+    }
+
+    #[rstest]
+    fn test_format_narinfo_matches_reference(
+        #[values("/nix/store", "/gnu/store")] store_dir: &str,
+        #[values(false, true)] all_fields: bool,
+    ) {
+        use harmonia_utils_hash::Algorithm;
+
+        let store_dir = StoreDir::new(store_dir).unwrap();
+        let mut narinfo = NarInfo {
+            path: "1fl4qsghsryd5f764m5v64vlxdz9d8qx-gtk+3-3.24.52"
+                .parse()
+                .unwrap(),
+            info: UnkeyedNarInfo {
+                info: UnkeyedValidPathInfo {
+                    deriver: None,
+                    nar_hash: sample_nar_hash(),
+                    references: BTreeSet::new(),
+                    registration_time: None,
+                    nar_size: 44_022_016,
+                    ultimate: false,
+                    signatures: BTreeSet::new(),
+                    ca: None,
+                    store_dir: store_dir.clone(),
+                },
+                url: None,
+                compression: None,
+                download_hash: None,
+                download_size: None,
+            },
+        };
+        if all_fields {
+            let ni = &mut narinfo.info;
+            ni.url =
+                Some("nar/1qay62c4dh5k43lg07bws8x3d62yq3sgkh1naws7qkq3cma9k089.nar.zst".into());
+            ni.compression = Some("zstd".into());
+            // SHA-512 hashes and `u64::MAX` sizes give the longest lines, to test
+            // the capacity bound.
+            ni.download_hash = Some(Algorithm::SHA512.digest(b"nar.zst"));
+            ni.download_size = Some(u64::MAX);
+            let pi = &mut ni.info;
+            pi.nar_size = u64::MAX;
+            pi.references = [
+                "1fl4qsghsryd5f764m5v64vlxdz9d8qx-gtk+3-3.24.52",
+                "3dkchpfn8r3ipsccl1001xhcl5smfjdx-glib-2.88.3",
+                "h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25",
+            ]
+            .into_iter()
+            .map(|p| p.parse().unwrap())
+            .collect();
+            pi.deriver = Some(
+                "aamr05ja1m7109img97czd1qkvznr1g6-gtk+3-3.24.52.drv"
+                    .parse()
+                    .unwrap(),
+            );
+            let sig = "66ceTRASe4ZHLcbUGh7Sun7E682yA7+rpKS/w1ifM/NRSkQJsZjkrizPzNRZEFw6tfAUToYXoH8Kh2+wVrznBQ==";
+            pi.signatures = ["cache.nixos.org-1", "harmonia-test-1"]
+                .into_iter()
+                .map(|key| format!("{key}:{sig}").parse().unwrap())
+                .collect();
+            pi.ca = Some(ContentAddress::NixArchive(
+                Algorithm::SHA512.digest(b"source"),
+            ));
+        }
+
+        let actual = format_narinfo_txt(&store_dir, &narinfo);
+        let expected = format_narinfo_txt_reference(&store_dir, &narinfo);
+        assert_eq!(
+            std::str::from_utf8(&actual).unwrap(),
+            std::str::from_utf8(&expected).unwrap()
+        );
+        assert!(actual.len() <= narinfo_txt_capacity(&store_dir, &narinfo));
     }
 
     fn sample_nar_hash() -> NarHash {
