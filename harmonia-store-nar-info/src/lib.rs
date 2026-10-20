@@ -243,7 +243,9 @@ pub fn parse_narinfo_txt(store_dir: &StoreDir, s: &str) -> Result<NarInfo, NarIn
                     });
                 }
                 have_references = true;
-                for r in value.split_whitespace() {
+                // Like Nix's `tokenizeString(value, " ")` in libstore/nar-info.cc,
+                // split on spaces only and skip empty tokens.
+                for r in value.split(' ').filter(|t| !t.is_empty()) {
                     references.insert(
                         StorePath::from_bytes(r.as_bytes())
                             .map_err(|e| invalid("References", &e))?,
@@ -578,6 +580,35 @@ mod tests {
         assert!(matches!(
             parse_with(field, Some(&value)),
             Err(NarInfoParseError::InvalidField { field: f, .. }) if f == field
+        ));
+    }
+
+    const REF_A: &str = "0jqd0rlxzra1rs38rdxl43yh6rxchgc6-curl-7.82.0";
+    const REF_B: &str = "55xkmqns51sw7nrgykp5vnz36w4fr3cw-nix-2.1.3";
+
+    // Like Nix, split on spaces only and skip empty tokens.
+    #[rstest]
+    #[case::multiple_spaces(format!("{REF_A}   {REF_B}"), &[REF_A, REF_B])]
+    #[case::leading_and_trailing_spaces(format!("  {REF_A} {REF_B} "), &[REF_A, REF_B])]
+    #[case::empty(String::new(), &[])]
+    fn test_parse_references(#[case] value: String, #[case] expected: &[&str]) {
+        let expected: BTreeSet<StorePath> = expected.iter().map(|p| p.parse().unwrap()).collect();
+        let info = parse_with("References", Some(&value)).unwrap();
+        assert_eq!(info.info.info.references, expected);
+    }
+
+    // Other whitespace doesn't separate references, so the two paths parse as
+    // one invalid store path.
+    #[rstest]
+    #[case::tab(format!("{REF_A}\t{REF_B}"))]
+    #[case::no_break_space(format!("{REF_A}\u{a0}{REF_B}"))]
+    fn test_parse_references_rejected(#[case] value: String) {
+        assert!(matches!(
+            parse_with("References", Some(&value)),
+            Err(NarInfoParseError::InvalidField {
+                field: "References",
+                ..
+            })
         ));
     }
 
