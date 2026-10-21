@@ -21,7 +21,9 @@ pub const ALPHABET: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 /// The nix-base32 alphabet as a byte slice (convenience alias).
 pub const ALPHABET_BYTES: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
-/// Nix base32 encoding (lowercase, without padding, LSB first, reversed)
+/// data-encoding's LSB-first base32 with Nix's alphabet. Nix writes the
+/// characters in the opposite order, so `decode_mut` decodes a reversed copy
+/// of its input.
 static NIX_BASE32: LazyLock<Encoding> = LazyLock::new(|| {
     let mut spec = Specification::new();
     spec.symbols.push_str(ALPHABET);
@@ -48,27 +50,65 @@ pub const fn decode_len(len: usize) -> usize {
 
 #[allow(unsafe_code)]
 pub fn encode_string(input: &[u8]) -> String {
-    let mut output = NIX_BASE32.encode(input);
-    // Nix base32 is reversed
-    unsafe { output.as_bytes_mut() }.reverse();
-    output
+    let mut output = vec![0; encode_len(input.len())];
+    encode_mut(input, &mut output);
+    // SAFETY: encode_mut writes only ALPHABET bytes, which are ASCII.
+    unsafe { String::from_utf8_unchecked(output) }
 }
 
+/// Encodes `input` into `output`.
+///
+/// Nix reads the input as a little-endian number and writes its 5-bit digits
+/// most significant first. So every 5 input bytes make 8 characters, and the
+/// first 5 bytes make the last 8.
+///
+/// # Panics
+///
+/// Panics if `output.len()` is not `encode_len(input.len())`.
 pub fn encode_mut(input: &[u8], output: &mut [u8]) {
-    // Encode directly into output buffer
-    NIX_BASE32.encode_mut(input, output);
-
-    // Reverse for Nix format
-    output.reverse();
+    assert_eq!(output.len(), encode_len(input.len()));
+    let (chunks, tail) = input.as_chunks::<5>();
+    let (out_tail, out_chunks) = output.as_rchunks_mut::<8>();
+    // The 0 to 4 leftover bytes make the first 0 to 7 characters.
+    let n = tail.iter().rev().fold(0, |n, &b| n << 8 | u64::from(b));
+    encode_digits(n, out_tail);
+    for (chunk, out) in chunks.iter().rev().zip(out_chunks) {
+        let mut bytes = [0; 8];
+        bytes[..5].copy_from_slice(chunk);
+        encode_digits(u64::from_le_bytes(bytes), out);
+    }
 }
+
+/// Writes the low `out.len()` digits of `n`, most significant first.
+fn encode_digits(mut n: u64, out: &mut [u8]) {
+    for c in out.iter_mut().rev() {
+        *c = ALPHABET_BYTES[(n & 31) as usize];
+        n >>= 5;
+    }
+}
+
+/// `decode_mut` reverses inputs up to this length on the stack instead of the
+/// heap. It is the nix32 length of a SHA-512 digest, the longest hash Nix
+/// writes in nix32.
+const STACK_DECODE_LEN: usize = encode_len(64);
 
 pub fn decode_mut(input: &[u8], output: &mut [u8]) -> Result<usize, DecodePartial> {
-    // Reverse the input for decoding
-    let mut reversed = input.to_vec();
+    // Nix base32 is reversed, so decode a reversed copy of the input.
+    let mut stack = [0u8; STACK_DECODE_LEN];
+    let mut heap;
+    let reversed: &mut [u8] = match stack.get_mut(..input.len()) {
+        Some(buf) => {
+            buf.copy_from_slice(input);
+            buf
+        }
+        None => {
+            heap = input.to_vec();
+            &mut heap
+        }
+    };
     reversed.reverse();
 
-    // Decode using data-encoding
-    NIX_BASE32.decode_mut(&reversed, output).map_err(|err| {
+    NIX_BASE32.decode_mut(reversed, output).map_err(|err| {
         // Adjust error position to account for reversal
         let adjusted_pos = input.len() - err.error.position - 1;
         DecodePartial {
@@ -256,6 +296,36 @@ mod unittests {
         let mut output = vec![0u8; decode_len(data.len())];
         assert_eq!(decode_mut(data.as_bytes(), &mut output), expected);
     }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_encode_wrong_output_len() {
+        encode_mut(&[0; 20], &mut [0; 33]);
+    }
+
+    #[test]
+    fn test_decode_stack_and_heap() {
+        // A 64-byte SHA-512 digest encodes to STACK_DECODE_LEN characters, so
+        // decode_mut reverses the encodings of longer data on the heap.
+        for len in 0..=80 {
+            let data: Vec<u8> = (0..len as u8).collect();
+            let encoded = encode_string(&data).into_bytes();
+            let mut output = vec![0u8; len];
+            assert_eq!(decode_mut(&encoded, &mut output), Ok(len));
+            assert_eq!(output, data);
+
+            for pos in 0..encoded.len() {
+                let mut input = encoded.clone();
+                input[pos] = b'|';
+                assert_eq!(
+                    decode_mut(&input, &mut output),
+                    fail(pos, DecodeKind::Symbol),
+                    "symbol at {pos} of {}",
+                    input.len()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -264,7 +334,20 @@ mod proptests {
 
     use super::*;
 
+    /// A reference encoder that runs data-encoding's LSB-first base32 and
+    /// reverses the output.
+    fn data_encoding_encode(input: &[u8]) -> String {
+        NIX_BASE32.encode(input).chars().rev().collect()
+    }
+
     proptest! {
+        #[test]
+        fn proptest_encode_matches_data_encoding(data: Vec<u8>) {
+            for len in 0..=data.len() {
+                prop_assert_eq!(encode_string(&data[..len]), data_encoding_encode(&data[..len]));
+            }
+        }
+
         #[test]
         fn proptest_roundtrip(data: Vec<u8>) {
             let mut encoded = vec![0u8; encode_len(data.len())];

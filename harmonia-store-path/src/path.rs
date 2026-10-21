@@ -60,7 +60,10 @@ impl StorePath {
 
     /// Convert to base path (just the hash-name part, without store directory)
     pub fn to_base_path(&self) -> String {
-        self.to_string()
+        use fmt::Write as _;
+        let mut s = String::with_capacity(STORE_PATH_HASH_ENCODED_SIZE + 1 + self.name.len());
+        write!(s, "{self}").expect("writing to a String cannot fail");
+        s
     }
 
     /// Convert to absolute path by combining with the store directory
@@ -109,7 +112,9 @@ impl fmt::Debug for StorePath {
 
 impl fmt::Display for StorePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.hash, self.name)
+        fmt::Display::fmt(&self.hash, f)?;
+        f.write_str("-")?;
+        f.write_str(&self.name)
     }
 }
 
@@ -198,7 +203,9 @@ impl FromStoreDirStr for StorePath {
 
 impl StoreDirDisplay for StorePath {
     fn fmt(&self, store_dir: &StoreDir, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{store_dir}/{self}")
+        f.write_str(store_dir.to_str())?;
+        f.write_str("/")?;
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -289,19 +296,31 @@ impl FromStr for StorePathHash {
 
 impl std_hash::Hash for StorePathHash {
     fn hash<H: std_hash::Hasher>(&self, state: &mut H) {
-        for c in self.0.iter().rev() {
-            c.hash(state);
-        }
+        // The digest has a fixed length, so it needs no length prefix.
+        state.write(&self.0);
     }
 }
 
 impl Ord for StorePathHash {
+    // Other crates can only inline this with #[inline], and BTreeSet, sort
+    // and binary_search call it for every comparison.
+    #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.iter().rev().cmp(other.0.iter().rev())
+        // Nix base32 writes the last byte first, so the text order is the
+        // order of the digest read as a little-endian integer. Compare the
+        // top 4 bytes, then the low 16.
+        const _: () = assert!(STORE_PATH_HASH_SIZE == 4 + 16);
+        let key = |h: &Self| {
+            let high = u32::from_le_bytes(*h.0.last_chunk().unwrap());
+            let low = u128::from_le_bytes(*h.0.first_chunk().unwrap());
+            (high, low)
+        };
+        key(self).cmp(&key(other))
     }
 }
 
 impl PartialOrd for StorePathHash {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -585,6 +604,22 @@ mod unittests {
     fn parse_hash_error(#[case] hash: &str, #[case] expected: StorePathError) {
         let err = hash.parse::<StorePathHash>().expect_err("parse failure");
         assert_eq!(err, expected);
+    }
+
+    #[test]
+    fn store_path_hash() {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+        let a: StorePath = "00ljmhbmf3d12aq4l5l7yr7bxn03yqvf-a".parse().unwrap();
+        let b: StorePath = "00ljmhbmf3d12aq4l5l7yr7bxn03yqvf-b".parse().unwrap();
+        let c: StorePath = "0sbwqgpi6jbqr710w5vn0b4s5w6z8n8n-a".parse().unwrap();
+
+        // Parsing doesn't check the digest against the name, so untrusted
+        // input can hold many paths with one digest. They must still hash
+        // differently.
+        let state = BuildHasherDefault::<DefaultHasher>::default();
+        assert_ne!(state.hash_one(&a), state.hash_one(&b));
+        assert_ne!(state.hash_one(&a), state.hash_one(&c));
     }
 
     #[test]
@@ -930,7 +965,42 @@ mod unittests {
 mod proptests {
     use proptest::prelude::*;
 
-    use crate::{StoreDir, StorePath, StorePathName};
+    use crate::{StoreDir, StorePath, StorePathHash, StorePathName};
+
+    /// Two hashes that share bytes `n..20` for a random `n`. The highest
+    /// byte that differs decides the order, so the pairs reach every byte
+    /// position, and `n == 0` gives equal hashes.
+    fn arb_hash_pair() -> impl Strategy<Value = (StorePathHash, StorePathHash)> {
+        (
+            any::<StorePathHash>(),
+            any::<StorePathHash>(),
+            0..=StorePathHash::len(),
+        )
+            .prop_map(|(a, mut b, n)| {
+                b.0[n..].copy_from_slice(&a.0[n..]);
+                (a, b)
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_store_path_hash_ord_reversed_bytes((a, b) in arb_hash_pair()) {
+            prop_assert_eq!(a.cmp(&b), a.0.iter().rev().cmp(b.0.iter().rev()));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_store_path_ord_matches_string(
+            (hash_a, hash_b) in arb_hash_pair(),
+            name_a in any::<StorePathName>(),
+            name_b in any::<StorePathName>(),
+        ) {
+            let a = StorePath { hash: hash_a, name: name_a };
+            let b = StorePath { hash: hash_b, name: name_b };
+            prop_assert_eq!(a.cmp(&b), a.to_string().cmp(&b.to_string()));
+        }
+    }
 
     proptest! {
         #[test]
@@ -956,6 +1026,25 @@ mod proptests {
             let s = store_dir.display(&path).to_string();
             let parsed = store_dir.parse::<StorePath>(&s).expect("Parsing display");
             prop_assert_eq!(path, parsed);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_display_format(store_dir in any::<StoreDir>(), path in any::<StorePath>()) {
+            let base = format!("{}-{}", path.hash(), path.name());
+            let full = format!("{}/{base}", store_dir.to_str());
+            let display = store_dir.display(&path);
+            prop_assert_eq!(path.to_string(), base.as_str());
+            prop_assert_eq!(path.to_base_path(), base.as_str());
+            prop_assert_eq!(store_dir.to_string(), store_dir.to_str());
+            prop_assert_eq!(display.to_string(), full.as_str());
+
+            // Width and fill are ignored.
+            let w = full.len() + 1;
+            prop_assert_eq!(format!("{path:>w$}"), base.as_str());
+            prop_assert_eq!(format!("{store_dir:>w$}"), store_dir.to_str());
+            prop_assert_eq!(format!("{display:>w$}"), full.as_str());
         }
     }
 }

@@ -1,26 +1,34 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write as _};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::fs::File;
+use std::future::poll_fn;
+use std::io::{self, IoSlice, Write};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
-use bstr::ByteSlice as _;
 use bytes::Bytes;
 use derive_more::Display;
 use futures_core::Stream;
+use harmonia_utils_io::AsyncBytesRead;
+use nix::errno::Errno;
+use nix::fcntl::{AT_FDCWD, OFlag, openat};
+use nix::sys::stat::{
+    FchmodatFlags, Mode, UtimensatFlags, fchmod, fchmodat, fstat, futimens, mkdirat, utimensat,
+};
+use nix::sys::time::TimeSpec;
+use nix::unistd::symlinkat;
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncReadExt as _};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::{JoinError, spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use super::dumper::FILE_CHUNK_SIZE;
-use super::{CASE_HACK_SUFFIX, NarEvent};
+use super::{CASE_HACK_SUFFIX, NarEvent, is_valid_entry_name};
 
 #[derive(Display, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
 pub enum NarWriteOperation {
@@ -87,18 +95,20 @@ pub struct NarRestorer {
     depth: usize,
     /// Whether the NAR's root entry has been seen.
     root_seen: bool,
+    /// See [`RestoreOptions::canonical`].
+    canonical: bool,
 }
 
 impl NarRestorer {
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
-        Self::new_restorer(path, false)
+        Self::new_restorer(path, false, false)
     }
 
     pub fn with_case_hack<P: Into<PathBuf>>(path: P) -> Self {
-        Self::new_restorer(path, true)
+        Self::new_restorer(path, true, false)
     }
 
-    fn new_restorer<P>(path: P, use_case_hack: bool) -> Self
+    fn new_restorer<P>(path: P, use_case_hack: bool, canonical: bool) -> Self
     where
         P: Into<PathBuf>,
     {
@@ -110,6 +120,7 @@ impl NarRestorer {
             dir_stack: Default::default(),
             depth: 0,
             root_seen: false,
+            canonical,
         }
     }
 
@@ -120,8 +131,7 @@ impl NarRestorer {
     /// a single path component, and nothing follows the root or closes it twice.
     fn check_event<R>(&mut self, event: &NarEvent<R>) -> Result<(), NarWriteError> {
         let invalid = |name: &[u8], reason| {
-            let name = name.to_os_str_lossy();
-            NarWriteError::invalid_entry_error(self.path.join(name), reason)
+            NarWriteError::invalid_entry_error(join_name(&self.path, name), reason)
         };
         let name = match event {
             NarEvent::File { name, .. }
@@ -143,12 +153,7 @@ impl NarRestorer {
                 return Err(invalid(name, "the root has a name"));
             }
             self.root_seen = true;
-        } else if name.is_empty()
-            || name.as_ref() == b"."
-            || name.as_ref() == b".."
-            || name.contains(&b'/')
-            || name.contains(&0)
-        {
+        } else if !is_valid_entry_name(name) {
             return Err(invalid(name, "invalid file name"));
         }
         if matches!(event, NarEvent::StartDirectory { .. }) {
@@ -164,8 +169,11 @@ impl NarRestorer {
         writer: &Writer,
     ) -> Result<(), NarWriteError>
     where
-        R: AsyncBufRead + Unpin,
+        R: AsyncBytesRead + Unpin,
     {
+        // The number of directories open around the event's entry, before
+        // `check_event` counts a directory it starts or ends.
+        let depth = self.depth;
         self.check_event(&event)?;
         match event {
             NarEvent::File {
@@ -180,39 +188,33 @@ impl NarRestorer {
                     name
                 };
 
-                let path = join_name(&self.path, &name)?;
-                writer
-                    .send(Op::CreateFile(path.clone(), executable))
-                    .await?;
-                let mut left = size;
+                // `name` is a slice of the parser's read buffer, and the
+                // parser can't reuse that buffer while the slice lives. The
+                // path goes on `self.path` instead, where read errors find
+                // it, so this arm can drop `name` before reading the file.
+                let dir_len = self.path.as_os_str().len();
+                if !name.is_empty() {
+                    self.path.push(OsStr::from_bytes(&name));
+                }
+                drop(name);
+                let mut file = FileData {
+                    create: Some((depth, self.path.clone(), executable)),
+                    left: size,
+                    copied: Vec::new(),
+                };
                 loop {
-                    // The parser's reads are small, so this collects bigger
-                    // chunks for the writer. Reading to the end of the file
-                    // also drains its padding.
-                    let mut chunk = Vec::with_capacity(left.min(FILE_CHUNK_SIZE as u64) as usize);
-                    (&mut reader)
-                        .take(FILE_CHUNK_SIZE as u64)
-                        .read_to_end(&mut chunk)
+                    // Reading to the end of the file also drains its padding.
+                    let piece = poll_fn(|cx| Pin::new(&mut reader).poll_fill_buf(cx))
                         .await
-                        .map_err(|err| NarWriteError::create_file_error(path.clone(), err))?;
-                    left = left.saturating_sub(chunk.len() as u64);
-                    let last = chunk.len() < FILE_CHUNK_SIZE;
-                    if !chunk.is_empty() {
-                        // The permit counts the bytes read, not `size`, so a
-                        // reader that returns more than `size` still stays
-                        // inside the budget.
-                        let permit = writer
-                            .data
-                            .clone()
-                            .acquire_many_owned(chunk.len() as u32)
-                            .await
-                            .expect("the semaphore is never closed");
-                        writer.send(Op::Write(chunk, permit)).await?;
-                    }
-                    if last {
+                        .map_err(|err| NarWriteError::create_file_error(self.path.clone(), err))?;
+                    if piece.is_empty() {
                         break;
                     }
+                    let taken = file.take(piece, &self.path, writer).await?;
+                    Pin::new(&mut reader).consume(taken);
                 }
+                file.finish(&self.path, writer).await?;
+                truncate_path(&mut self.path, dir_len);
             }
             NarEvent::Symlink { name, target } => {
                 let name = if self.use_case_hack {
@@ -221,16 +223,10 @@ impl NarRestorer {
                     name
                 };
 
-                let path = join_name(&self.path, &name)?;
-                let target_os = target
-                    .to_os_str()
-                    .map_err(|err| {
-                        let lossy = target.to_os_str_lossy().into_owned();
-                        let path = PathBuf::from(lossy);
-                        NarWriteError::path_utf8_error(path, err)
-                    })?
-                    .to_owned();
-                writer.send(Op::CreateSymlink(path, target_os)).await?;
+                let path = join_name(&self.path, &name);
+                writer
+                    .send(Op::Create(depth, path, Kind::Symlink(target)))
+                    .await?;
             }
             NarEvent::StartDirectory { name } => {
                 let name = if self.use_case_hack {
@@ -244,15 +240,23 @@ impl NarRestorer {
                     name
                 };
 
-                let path = join_name(&self.path, &name)?;
-                self.path = path;
-                writer.send(Op::CreateDirectory(self.path.clone())).await?;
+                if !name.is_empty() {
+                    self.path.push(OsStr::from_bytes(&name));
+                }
+                let path = self.path.clone();
+                writer
+                    .send(Op::Create(depth, path, Kind::Directory))
+                    .await?;
             }
             NarEvent::EndDirectory => {
                 if self.use_case_hack {
                     self.entries = self.dir_stack.pop().unwrap_or_default();
                 }
-                self.path.pop();
+                // The root is the destination itself, so it stays on the path
+                // that error messages show.
+                if self.depth > 0 {
+                    self.path.pop();
+                }
             }
         }
         Ok(())
@@ -265,12 +269,19 @@ impl NarRestorer {
     /// without waiting for more of the stream. Otherwise `restore` waits for
     /// the thread to finish everything in the queue before it returns, even
     /// with an error. If the caller drops the future instead, the thread
-    /// finishes the entry it is working on and skips the rest of the queue.
+    /// stops before its next op and skips the rest of the queue, so the
+    /// file it was writing can be left short.
+    ///
+    /// `restore` reads file contents through [`AsyncBytesRead`], so that
+    /// large pieces of them reach that thread without a copy. The parser's
+    /// [`ParsedFile`](crate::ParsedFile) implements it. Wrap any other
+    /// [`AsyncRead`](tokio::io::AsyncRead) in a
+    /// [`BytesReader`](harmonia_utils_io::BytesReader).
     pub async fn restore<S, U, R>(mut self, stream: S) -> Result<(), NarWriteError>
     where
         S: Stream<Item = U>,
         U: Into<Result<NarEvent<R>, NarWriteError>>,
-        R: AsyncBufRead + Send + Unpin,
+        R: AsyncBytesRead + Send + Unpin,
     {
         use futures_util::StreamExt as _;
         use futures_util::future::{Either, select};
@@ -278,7 +289,7 @@ impl NarRestorer {
         let dropped = CancellationToken::new();
         let written = spawn_blocking({
             let dropped = dropped.clone();
-            move || write(queued, &dropped)
+            move || write(queued, &dropped, self.canonical)
         });
         let writer = Writer {
             ops,
@@ -287,12 +298,18 @@ impl NarRestorer {
         let sent = async {
             // This future owns `writer`, so the queue closes when it finishes.
             let writer = writer;
-            futures_util::pin_mut!(stream);
-            while let Some(item) = stream.next().await {
-                let event = item.into()?;
-                self.process_event(event, &writer).await?;
+            let sent = async {
+                futures_util::pin_mut!(stream);
+                while let Some(item) = stream.next().await {
+                    self.process_event(item.into()?, &writer).await?;
+                }
+                Ok::<_, NarWriteError>(())
             }
-            Ok(())
+            .await;
+            // The directories that ended after the last entry end now, even
+            // after an error, as if each had ended right away.
+            let ended = writer.send(Op::EndDirectories(self.depth)).await;
+            sent.and(ended)
         };
         futures_util::pin_mut!(sent);
         // Locals drop in reverse order, so if the caller drops the future,
@@ -313,34 +330,201 @@ impl NarRestorer {
     }
 }
 
-fn join_name(path: &Path, name: &[u8]) -> Result<PathBuf, NarWriteError> {
-    if name.is_empty() {
-        Ok(path.to_owned())
-    } else {
-        let name_os = name.to_os_str().map_err(|err| {
-            let lossy = name.to_os_str_lossy();
-            let path = path.join(lossy);
-            NarWriteError::path_utf8_error(path, err)
-        })?;
-        Ok(path.join(name_os))
+/// Returns the path of entry `name` in `dir` with a single allocation. The
+/// root's empty name gives `dir` itself. Unlike [`PathBuf::push`], it keeps
+/// `dir` when `name` starts with a slash, so an error about an invalid name
+/// still names a path in `dir`.
+fn join_name(dir: &Path, name: &[u8]) -> PathBuf {
+    let mut path = PathBuf::with_capacity(dir.as_os_str().len() + 1 + name.len());
+    path.push(dir);
+    if !name.is_empty() {
+        // Pushing an empty path adds just the separator.
+        path.push("");
+        path.as_mut_os_string().push(OsStr::from_bytes(name));
     }
+    path
+}
+
+/// Returns the last `count` names in `path`, or all of `path` if it has
+/// fewer. Restore joins names with single slashes, and names have none.
+fn last_names(path: &Path, count: usize) -> &[u8] {
+    let path = path.as_os_str().as_bytes();
+    let (mut start, mut end) = (0, path.len());
+    for _ in 0..count {
+        let Some(slash) = path[..end].iter().rposition(|&b| b == b'/') else {
+            return path;
+        };
+        (start, end) = (slash + 1, slash);
+    }
+    &path[start..]
+}
+
+/// Cuts `path` back to its first `len` bytes. Unlike [`PathBuf::pop`], it
+/// doesn't parse the path.
+fn truncate_path(path: &mut PathBuf, len: usize) {
+    let mut bytes = std::mem::take(path).into_os_string().into_vec();
+    bytes.truncate(len);
+    *path = OsString::from_vec(bytes).into();
 }
 
 /// How many entries the writer thread's queue holds.
 const OPS_IN_FLIGHT: usize = 64;
 
+/// How many entries the writer thread takes from its queue at once. Taking
+/// them from a full queue wakes the task that fills it once per batch instead
+/// of once per entry. File data in a batch still counts towards
+/// [`DATA_IN_FLIGHT`].
+const OPS_PER_BATCH: usize = 32;
+
 /// How much file data the writer thread's queue holds, so a slow disk can't
 /// make a restore use much memory.
+///
+/// A copied chunk counts its capacity, and a piece that `restore` sends as
+/// it is counts its length. Such a piece keeps the whole buffer or chunk it
+/// is a slice of alive. With the parser's readers, everything in the queue
+/// comes from the stretch of the NAR between the oldest queued entry and
+/// the file being read, so those buffers add up to about that stretch plus
+/// one buffer at each end.
 const DATA_IN_FLIGHT: usize = 8 * FILE_CHUNK_SIZE;
+
+/// Pieces of a file's data at least this long go to the writer thread as
+/// they are. Shorter ones are copied together into chunks of up to
+/// [`FILE_CHUNK_SIZE`], so that a reader that hands out short pieces, like
+/// `parse_nar`'s, still makes few ops.
+const FORWARD_MIN: usize = 64 * 1024;
+
+/// The writer thread writes a file's queued data once it reaches this much,
+/// so that `restore` gets part of the budget back while it writes.
+const WRITE_AT: usize = DATA_IN_FLIGHT / 2;
 
 /// Filesystem work for the writer thread, in NAR order.
 enum Op {
-    CreateDirectory(PathBuf),
-    CreateSymlink(PathBuf, OsString),
-    CreateFile(PathBuf, bool),
+    /// Creates the entry at the path, which has the given number of
+    /// directories open around it. Any open directory deeper than that has
+    /// ended, so the writer thread ends it first. That saves an op per
+    /// directory.
+    Create(usize, PathBuf, Kind),
     /// More data for the last created file. The permit is its share of
     /// [`DATA_IN_FLIGHT`].
-    Write(Vec<u8>, OwnedSemaphorePermit),
+    Write(Bytes, OwnedSemaphorePermit),
+    /// Ends the open directories deeper than this. `restore` sends it last.
+    EndDirectories(usize),
+}
+
+/// What [`Op::Create`] creates.
+enum Kind {
+    Directory,
+    Symlink(Bytes),
+    /// A file, whether it is executable, and its first chunk of data.
+    File(bool, Bytes, OwnedSemaphorePermit),
+}
+
+/// Sends the data of the file that `restore` is reading to the writer
+/// thread.
+struct FileData {
+    /// The depth and path of the file and whether it is executable, until
+    /// `send` sends the first chunk with the [`Op::Create`] for the file.
+    create: Option<(usize, PathBuf, bool)>,
+    /// How much of the file's size is left to read.
+    left: u64,
+    /// Short pieces copied together.
+    copied: Vec<u8>,
+}
+
+impl FileData {
+    /// Sends `piece`, the next part of the data of the file at `path`, or
+    /// copies some of it. Returns how many bytes it took. Fails if `piece`
+    /// is longer than what is left of the file.
+    async fn take(
+        &mut self,
+        mut piece: Bytes,
+        path: &Path,
+        writer: &Writer,
+    ) -> Result<usize, NarWriteError> {
+        // The parser checks the size, but the events don't have to come from
+        // the parser.
+        if piece.len() as u64 > self.left {
+            let reason = "file is longer than its size";
+            return Err(NarWriteError::invalid_entry_error(path.into(), reason));
+        }
+        // A piece that is the rest of the file goes as it is, since copying
+        // it wouldn't save an op.
+        let rest = self.copied.is_empty() && piece.len() as u64 == self.left;
+        let taken = if piece.len() >= FORWARD_MIN || rest {
+            self.send_copied(writer).await?;
+            piece.truncate(FILE_CHUNK_SIZE);
+            let taken = piece.len();
+            self.send(piece, taken, writer).await?;
+            taken
+        } else {
+            if self.copied.is_empty() {
+                // `piece` isn't the rest of the file, so this has room for
+                // more than it.
+                let want = self.left.min(FILE_CHUNK_SIZE as u64);
+                self.copied.reserve_exact(want as usize);
+            }
+            let taken = piece.len().min(FILE_CHUNK_SIZE - self.copied.len());
+            self.copied.extend_from_slice(&piece[..taken]);
+            if self.copied.len() == FILE_CHUNK_SIZE {
+                self.send_copied(writer).await?;
+            }
+            taken
+        };
+        self.left -= taken as u64;
+        Ok(taken)
+    }
+
+    /// Sends what is left once the reader of the file at `path` has ended, or
+    /// creates the file empty if nothing was sent yet. Fails if the reader
+    /// ended before the file's size.
+    async fn finish(mut self, path: &Path, writer: &Writer) -> Result<(), NarWriteError> {
+        if self.left > 0 {
+            let reason = "file is shorter than its size";
+            return Err(NarWriteError::invalid_entry_error(path.into(), reason));
+        }
+        if self.create.is_some() && self.copied.is_empty() {
+            return self.send(Bytes::new(), 0, writer).await;
+        }
+        self.send_copied(writer).await
+    }
+
+    async fn send_copied(&mut self, writer: &Writer) -> Result<(), NarWriteError> {
+        if self.copied.is_empty() {
+            return Ok(());
+        }
+        // A chunk sent before it is full, because a big piece follows or the
+        // file ends early, would keep and count its unused capacity too.
+        self.copied.shrink_to_fit();
+        let size = self.copied.capacity();
+        let copied = Bytes::from(std::mem::take(&mut self.copied));
+        self.send(copied, size, writer).await
+    }
+
+    /// Sends `data`, which takes `size` bytes of memory, to the writer thread.
+    async fn send(
+        &mut self,
+        data: Bytes,
+        size: usize,
+        writer: &Writer,
+    ) -> Result<(), NarWriteError> {
+        // A file can be bigger than the whole budget, so each piece or chunk
+        // takes its own permit.
+        let permit = writer
+            .data
+            .clone()
+            .acquire_many_owned(size as u32)
+            .await
+            .expect("the semaphore is never closed");
+        // The op that creates the file also carries the first chunk, even an
+        // empty one, so a small file takes one op.
+        let op = match self.create.take() {
+            Some((depth, path, executable)) => {
+                Op::Create(depth, path, Kind::File(executable, data, permit))
+            }
+            None => Op::Write(data, permit),
+        };
+        writer.send(op).await
+    }
 }
 
 /// The queue to the writer thread, and the budget for the file data in it.
@@ -361,47 +545,284 @@ impl Writer {
     }
 }
 
-/// Does the filesystem work in `ops`, in order, with `std::fs`. If `dropped`
-/// is cancelled, it returns before the next entry and skips the rest.
-fn write(mut ops: mpsc::Receiver<Op>, dropped: &CancellationToken) -> Result<(), NarWriteError> {
-    let mut file: Option<(PathBuf, File)> = None;
-    while let Some(op) = ops.blocking_recv() {
-        // The caller dropped `restore`, so nobody waits for this work, and
-        // the caller may already be removing the destination.
-        if dropped.is_cancelled() {
-            break;
+/// Does the filesystem work in `ops`, in order. If `dropped` is cancelled,
+/// it returns before the next entry and skips the rest.
+fn write(
+    mut ops: mpsc::Receiver<Op>,
+    dropped: &CancellationToken,
+    canonical: bool,
+) -> Result<(), NarWriteError> {
+    let mut disk = Disk {
+        canonical,
+        chmod_files: canonical,
+        file: None,
+        queued: Vec::with_capacity(OPS_PER_BATCH),
+        queued_len: 0,
+        depth: 0,
+        dir: PathBuf::new(),
+        fds: Vec::new(),
+    };
+    let mut batch = Vec::with_capacity(OPS_PER_BATCH);
+    while ops.blocking_recv_many(&mut batch, OPS_PER_BATCH) > 0 {
+        for op in batch.drain(..) {
+            // The caller dropped `restore`, so nobody waits for this work, and
+            // the caller may already be removing the destination.
+            if dropped.is_cancelled() {
+                return Ok(());
+            }
+            disk.apply(op)?;
         }
-        match op {
-            Op::Write(data, _permit) => {
-                let (path, file) = file.as_mut().expect("file data follows its file");
-                file.write_all(&data)
-                    .map_err(|err| NarWriteError::create_file_error(path.clone(), err))?;
-            }
-            Op::CreateFile(path, executable) => {
-                trace!("Writing to file {:?}", path);
-                let mut options = OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                options.mode(if executable { 0o777 } else { 0o666 });
-                let created = options
-                    .open(&path)
-                    .map_err(|err| NarWriteError::create_file_error(path.clone(), err))?;
-                file = Some((path, created));
-            }
-            Op::CreateDirectory(path) => {
-                file = None;
-                std::fs::create_dir(&path)
-                    .map_err(|err| NarWriteError::create_dir_error(path, err))?;
-            }
-            Op::CreateSymlink(path, target) => {
-                file = None;
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(target, &path)
-                    .map_err(|err| NarWriteError::create_symlink_error(path, err))?;
-            }
+        // Write the batch's data before waiting for more. Otherwise this
+        // thread could hold the budget that `restore` waits for.
+        disk.write_queued()?;
+    }
+    disk.close_file()
+}
+
+/// The modification time Nix gives everything in the store.
+const CANONICAL_MTIME: TimeSpec = TimeSpec::new(1, 0);
+
+/// How the writer thread opens each directory it creates, to create the
+/// directory's entries relative to it. `O_NOFOLLOW` makes sure that is the
+/// new directory, not a symlink that replaced it. On Linux, `O_PATH` needs
+/// no read permission. Landlock rules that only allow creating entries, like
+/// nix-store-csi's, don't grant it. Elsewhere the directory is opened
+/// read-only.
+const DIR_FLAGS: OFlag = {
+    let flags = OFlag::O_DIRECTORY
+        .union(OFlag::O_NOFOLLOW)
+        .union(OFlag::O_CLOEXEC);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = flags.union(OFlag::O_PATH);
+    flags
+};
+
+/// How many open directories the writer thread keeps a descriptor for. It
+/// creates deeper entries by their path below the deepest of these, so a
+/// deeply nested NAR can't use up the process's descriptors.
+const DIR_FDS: usize = 64;
+
+/// Sets the modification time of entry `name` in `dir` to
+/// [`CANONICAL_MTIME`]. If the entry is a symlink, it sets the symlink's own.
+fn set_canonical_mtime(dir: BorrowedFd<'_>, name: &OsStr) -> Result<(), Errno> {
+    utimensat(
+        dir,
+        name,
+        &TimeSpec::UTIME_OMIT,
+        &CANONICAL_MTIME,
+        UtimensatFlags::NoFollowSymlink,
+    )
+}
+
+/// Writes all of `bufs` to `out`, like the unstable
+/// `Write::write_all_vectored`.
+fn write_all_vectored(out: &mut impl Write, mut bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
+    IoSlice::advance_slices(&mut bufs, 0);
+    while !bufs.is_empty() {
+        match out.write_vectored(bufs) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
         }
     }
     Ok(())
+}
+
+/// The writer thread's state between ops.
+struct Disk {
+    /// See [`RestoreOptions::canonical`].
+    canonical: bool,
+    /// With `canonical`, whether each new file needs an `fchmod` for its
+    /// mode. It stays true unless the root is a directory that kept all of
+    /// 0o555.
+    chmod_files: bool,
+    /// The last created file, which [`Op::Write`] appends to.
+    file: Option<(PathBuf, File)>,
+    /// Data for `file` that isn't written yet, so that the data of several
+    /// ops goes out in one `writev`. It holds at most one batch.
+    queued: Vec<(Bytes, OwnedSemaphorePermit)>,
+    /// How many bytes `queued` holds.
+    queued_len: usize,
+    /// How many directories are open.
+    depth: usize,
+    /// The path of the innermost open directory.
+    dir: PathBuf,
+    /// The outermost open directories, at most [`DIR_FDS`] of them.
+    fds: Vec<OwnedFd>,
+}
+
+impl Disk {
+    /// Returns the directory that the entry at `path` goes in, and the
+    /// entry's path there: the innermost open directory and the entry's
+    /// name, unless the entry is more than [`DIR_FDS`] directories deep.
+    /// Only the root comes before any directory is open, and it goes at
+    /// `path` itself.
+    fn locate<'a>(&'a self, path: &'a Path) -> (BorrowedFd<'a>, &'a OsStr) {
+        let Some(dir) = self.fds.last() else {
+            return (AT_FDCWD, path.as_os_str());
+        };
+        let below = last_names(path, self.depth - self.fds.len() + 1);
+        (dir.as_fd(), OsStr::from_bytes(below))
+    }
+
+    /// Does the filesystem work for one `op`. File data waits in `queued`.
+    fn apply(&mut self, op: Op) -> Result<(), NarWriteError> {
+        match op {
+            Op::Write(data, permit) => self.queue(data, permit)?,
+            Op::Create(depth, path, kind) => {
+                self.end_directories(depth)?;
+                debug_assert_eq!(
+                    self.depth, depth,
+                    "the directories around {path:?} are open"
+                );
+                let (dir, name) = self.locate(&path);
+                match kind {
+                    Kind::File(executable, data, permit) => {
+                        trace!("Writing to file {:?}", path);
+                        let mut mode = if executable { 0o777 } else { 0o666 };
+                        if self.canonical {
+                            // The mode only applies to later opens, so this
+                            // one can still write the file.
+                            mode &= !0o222;
+                        }
+                        // `O_EXCL` fails on a symlink too.
+                        let flags =
+                            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC;
+                        let mode = Mode::from_bits_truncate(mode);
+                        let err =
+                            |err: Errno| NarWriteError::create_file_error(path.clone(), err.into());
+                        let created = openat(dir, name, flags, mode).map_err(err)?;
+                        if self.chmod_files {
+                            fchmod(&created, mode).map_err(err)?;
+                        }
+                        self.file = Some((path, created.into()));
+                        self.queue(data, permit)?;
+                    }
+                    Kind::Directory => {
+                        let err =
+                            |err: Errno| NarWriteError::create_dir_error(path.clone(), err.into());
+                        mkdirat(dir, name, Mode::from_bits_truncate(0o777)).map_err(err)?;
+                        if self.fds.len() < DIR_FDS {
+                            let opened =
+                                openat(dir, name, DIR_FLAGS, Mode::empty()).map_err(err)?;
+                            self.fds.push(opened);
+                        }
+                        if self.canonical && depth == 0 {
+                            // New entries lose the same mode bits as the
+                            // root, to the umask or to a default ACL.
+                            let kept = fstat(&self.fds[0]).map_err(err)?.st_mode;
+                            self.chmod_files = kept & 0o555 != 0o555;
+                        }
+                        self.depth += 1;
+                        self.dir = path;
+                    }
+                    Kind::Symlink(target) => {
+                        let err = |err: Errno| {
+                            NarWriteError::create_symlink_error(path.clone(), err.into())
+                        };
+                        symlinkat(OsStr::from_bytes(&target), dir, name).map_err(err)?;
+                        if self.canonical {
+                            set_canonical_mtime(dir, name).map_err(err)?;
+                        }
+                    }
+                }
+            }
+            Op::EndDirectories(depth) => self.end_directories(depth)?,
+        }
+        Ok(())
+    }
+
+    /// Closes the last created file and ends the open directories deeper
+    /// than `depth`.
+    fn end_directories(&mut self, depth: usize) -> Result<(), NarWriteError> {
+        self.close_file()?;
+        while self.depth > depth {
+            self.depth -= 1;
+            if self.canonical {
+                // All its entries are restored, so it can be read-only now.
+                // `fchmod` fails on an `O_PATH` descriptor, but `.` below it
+                // is the directory and can't be a symlink. So this needs no
+                // `AT_SYMLINK_NOFOLLOW`, which libc emulates through /proc
+                // before Linux 6.6. A directory deeper than `DIR_FDS` gets a
+                // descriptor just for this.
+                let err =
+                    |err: Errno| NarWriteError::create_dir_error(self.dir.clone(), err.into());
+                let opened;
+                let dir = match self.fds.get(self.depth) {
+                    Some(dir) => dir.as_fd(),
+                    None => {
+                        let (parent, name) = self.locate(&self.dir);
+                        opened = openat(parent, name, DIR_FLAGS, Mode::empty()).map_err(err)?;
+                        opened.as_fd()
+                    }
+                };
+                let here = OsStr::new(".");
+                fchmodat(
+                    dir,
+                    here,
+                    Mode::from_bits_truncate(0o555),
+                    FchmodatFlags::FollowSymlink,
+                )
+                .and_then(|()| set_canonical_mtime(dir, here))
+                .map_err(err)?;
+            }
+            self.fds.truncate(self.depth);
+            // Its parent is the innermost open directory now.
+            let name = last_names(&self.dir, 1).len();
+            let parent = self.dir.as_os_str().len() - name;
+            truncate_path(&mut self.dir, parent.saturating_sub(1));
+        }
+        Ok(())
+    }
+
+    /// Queues `data` for the last created file.
+    fn queue(&mut self, data: Bytes, permit: OwnedSemaphorePermit) -> Result<(), NarWriteError> {
+        self.queued_len += data.len();
+        self.queued.push((data, permit));
+        if self.queued_len >= WRITE_AT {
+            self.write_queued()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the queued data to the last created file.
+    fn write_queued(&mut self) -> Result<(), NarWriteError> {
+        if self.queued.is_empty() {
+            return Ok(());
+        }
+        let (path, file) = self.file.as_mut().expect("file data follows its file");
+        let err = |err| NarWriteError::create_file_error(path.clone(), err);
+        if let [(data, _)] = &self.queued[..] {
+            // Most files are one piece, and `write_all` skips building the
+            // slices.
+            file.write_all(data).map_err(err)?;
+        } else {
+            let mut bufs = [IoSlice::new(&[]); OPS_PER_BATCH];
+            for (buf, (data, _)) in bufs.iter_mut().zip(&self.queued) {
+                *buf = IoSlice::new(data);
+            }
+            write_all_vectored(file, &mut bufs[..self.queued.len()]).map_err(err)?;
+        }
+        self.queued.clear();
+        self.queued_len = 0;
+        Ok(())
+    }
+
+    /// Writes the queued data and closes the last created file. With
+    /// `canonical`, it first sets the file's modification time to
+    /// [`CANONICAL_MTIME`]. Nothing writes to the file after that, so the time
+    /// stays.
+    fn close_file(&mut self) -> Result<(), NarWriteError> {
+        self.write_queued()?;
+        if let Some((path, file)) = self.file.take()
+            && self.canonical
+        {
+            futimens(&file, &TimeSpec::UTIME_OMIT, &CANONICAL_MTIME)
+                .map_err(|err| NarWriteError::create_file_error(path, err.into()))?;
+        }
+        Ok(())
+    }
 }
 
 struct CIString(Bytes, String);
@@ -456,6 +877,7 @@ impl Entries {
 
 pub struct RestoreOptions {
     use_case_hack: bool,
+    canonical: bool,
 }
 
 impl RestoreOptions {
@@ -464,11 +886,29 @@ impl RestoreOptions {
         let use_case_hack = true;
         #[cfg(not(target_os = "macos"))]
         let use_case_hack = false;
-        Self { use_case_hack }
+        Self {
+            use_case_hack,
+            canonical: false,
+        }
     }
 
     pub fn use_case_hack(mut self, use_case_hack: bool) -> Self {
         self.use_case_hack = use_case_hack;
+        self
+    }
+
+    /// Whether to give the tree the metadata Nix gives store paths while
+    /// restoring it, so that it needs no second pass. Off by default.
+    ///
+    /// Files get mode 0o555 if executable and 0o444 otherwise, and
+    /// directories get 0o555, whatever the process umask. Every entry,
+    /// symlinks included, gets the modification time 1 and keeps its access
+    /// time. A directory gets its mode after its last entry, so if a restore
+    /// fails, the directories it finished are already read-only. Restore
+    /// checks the umask once, when it creates the root, so changing the
+    /// umask during a restore can still take bits off files.
+    pub fn canonical(mut self, canonical: bool) -> Self {
+        self.canonical = canonical;
         self
     }
 
@@ -477,10 +917,11 @@ impl RestoreOptions {
         S: Stream<Item = U>,
         U: Into<Result<NarEvent<R>, NarWriteError>>,
         P: Into<PathBuf>,
-        R: AsyncBufRead + Send + Unpin,
+        R: AsyncBytesRead + Send + Unpin,
     {
-        let restorer = NarRestorer::new_restorer(path, self.use_case_hack);
-        restorer.restore(stream).await
+        NarRestorer::new_restorer(path, self.use_case_hack, self.canonical)
+            .restore(stream)
+            .await
     }
 }
 
@@ -495,19 +936,28 @@ where
     S: Stream<Item = U>,
     U: Into<Result<NarEvent<R>, NarWriteError>>,
     P: Into<PathBuf>,
-    R: AsyncBufRead + Send + Unpin,
+    R: AsyncBytesRead + Send + Unpin,
 {
     RestoreOptions::new().restore(stream, path).await
 }
 
 #[cfg(test)]
 mod unittests {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
     use crate::archive::{NarEvent, dump, test_data};
     use futures_util::FutureExt as _;
     use futures_util::stream::{StreamExt as _, TryStreamExt as _, iter};
+    use harmonia_utils_io::{BytesReader, BytesStreamReader};
     use rstest::rstest;
     use tempfile::Builder;
+
+    /// Held by the tests that change the umask or check the file modes it
+    /// affects. The umask belongs to the whole process, and `cargo test`
+    /// runs tests on threads of one process.
+    static UMASK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     #[rstest]
@@ -520,20 +970,54 @@ mod unittests {
     #[case::symlink(test_data::symlink())]
     #[case::dir_example(test_data::dir_example())]
     #[case::case_hack_sorting(test_data::case_hack_sorting())]
-    async fn test_restore(#[case] events: test_data::TestNarEvents) {
+    #[case::many_files(many_files())]
+    #[case::deep_dirs(deep_dirs())]
+    async fn test_restore(
+        #[case] events: test_data::TestNarEvents,
+        #[values(false, true)] canonical: bool,
+    ) {
+        let _umask = UMASK.lock().await;
         let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
         let path = dir.path().join("output");
 
         let events_s = iter(events.clone().into_iter())
             .map(|e| Ok(e) as Result<test_data::TestNarEvent, NarWriteError>);
-        restore(events_s, &path).await.unwrap();
+        RestoreOptions::new()
+            .canonical(canonical)
+            .restore(events_s, &path)
+            .await
+            .unwrap();
 
-        let s = dump(path)
+        let s = dump(&path)
             .and_then(NarEvent::read_file)
             .try_collect::<test_data::TestNarEvents>()
             .await
             .unwrap();
         assert_eq!(s, events);
+        if canonical {
+            check_canonical(&path);
+        }
+    }
+
+    /// Checks that every entry in `path` has Nix's canonical mode and
+    /// modification time, and makes the directories writable again so the
+    /// test can remove them.
+    fn check_canonical(path: &Path) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for entry in walkdir::WalkDir::new(path).follow_root_links(false) {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            let at = entry.path();
+            assert_eq!((meta.mtime(), meta.mtime_nsec()), (1, 0), "{at:?}");
+            let mode = meta.mode() & 0o7777;
+            if meta.is_dir() {
+                assert_eq!(mode, 0o555, "{at:?}");
+                std::fs::set_permissions(at, Permissions::from_mode(0o755)).unwrap();
+            } else if meta.is_file() {
+                assert!(matches!(mode, 0o444 | 0o555), "{at:?}: {mode:o}");
+            }
+        }
     }
 
     fn file(name: &'static [u8]) -> test_data::TestNarEvent {
@@ -558,26 +1042,61 @@ mod unittests {
         }
     }
 
+    /// Events for more files than the writer thread's queue and one batch
+    /// hold. Each file contains its own name, so data written to the wrong
+    /// file fails the test.
+    fn many_files() -> test_data::TestNarEvents {
+        let files = (0..2 * (OPS_IN_FLIGHT + OPS_PER_BATCH)).map(|i| {
+            let name = Bytes::from(format!("{i:04}"));
+            NarEvent::File {
+                name: name.clone(),
+                executable: false,
+                size: name.len() as u64,
+                reader: std::io::Cursor::new(name),
+            }
+        });
+        std::iter::once(start_dir(b""))
+            .chain(files)
+            .chain([NarEvent::EndDirectory])
+            .collect()
+    }
+
+    /// Events for directories nested deeper than the writer thread keeps
+    /// descriptors for, with a file and a symlink at the bottom.
+    fn deep_dirs() -> test_data::TestNarEvents {
+        let depth = DIR_FDS + 2;
+        let mut events = vec![start_dir(b"")];
+        events.extend((0..depth).map(|_| start_dir(b"d")));
+        events.extend([file(b"f"), symlink(b"l")]);
+        events.extend((0..=depth).map(|_| NarEvent::EndDirectory));
+        events
+    }
+
     /// `restore` doesn't trust its input: whatever the stream says, nothing
-    /// may be created outside the destination.
+    /// may be created outside the destination. The error names the entry
+    /// inside the destination, or the destination itself.
     #[tokio::test]
     #[rstest]
-    #[case::dotdot(vec![start_dir(b""), file(b"..")])]
-    #[case::dot(vec![start_dir(b""), file(b".")])]
-    #[case::slash(vec![start_dir(b""), file(b"a/b")])]
-    #[case::traversal(vec![start_dir(b""), file(b"../escape")])]
-    #[case::absolute(vec![start_dir(b""), file(b"/tmp/escape")])]
-    #[case::nul(vec![start_dir(b""), file(b"a\0b")])]
-    #[case::empty_name(vec![start_dir(b""), file(b"")])]
-    #[case::dotdot_dir(vec![start_dir(b""), start_dir(b".."), file(b"escape"), NarEvent::EndDirectory, NarEvent::EndDirectory])]
-    #[case::dotdot_symlink(vec![start_dir(b""), symlink(b"../escape")])]
-    #[case::named_root(vec![file(b"escape")])]
-    #[case::end_without_start(vec![NarEvent::EndDirectory, file(b"escape")])]
-    #[case::end_past_root(vec![start_dir(b""), NarEvent::EndDirectory, NarEvent::EndDirectory, file(b"escape")])]
-    #[case::after_root_dir(vec![start_dir(b""), NarEvent::EndDirectory, file(b"escape")])]
-    #[case::after_root_file(vec![file(b""), file(b"escape")])]
-    #[case::second_root(vec![start_dir(b""), NarEvent::EndDirectory, start_dir(b"")])]
-    async fn test_restore_rejects_escape(#[case] events: test_data::TestNarEvents) {
+    #[case::dotdot(vec![start_dir(b""), file(b"..")], "output/..")]
+    #[case::dot(vec![start_dir(b""), file(b".")], "output/.")]
+    #[case::slash(vec![start_dir(b""), file(b"a/b")], "output/a/b")]
+    #[case::traversal(vec![start_dir(b""), file(b"../escape")], "output/../escape")]
+    #[case::absolute(vec![start_dir(b""), file(b"/tmp/escape")], "output//tmp/escape")]
+    #[case::nul(vec![start_dir(b""), file(b"a\0b")], "output/a\0b")]
+    #[case::empty_name(vec![start_dir(b""), file(b"")], "output")]
+    #[case::dotdot_dir(vec![start_dir(b""), start_dir(b".."), file(b"escape"), NarEvent::EndDirectory, NarEvent::EndDirectory], "output/..")]
+    #[case::dotdot_symlink(vec![start_dir(b""), symlink(b"../escape")], "output/../escape")]
+    #[case::named_root(vec![file(b"escape")], "output/escape")]
+    #[case::end_without_start(vec![NarEvent::EndDirectory, file(b"escape")], "output")]
+    #[case::end_past_root(vec![start_dir(b""), NarEvent::EndDirectory, NarEvent::EndDirectory, file(b"escape")], "output")]
+    #[case::after_root_dir(vec![start_dir(b""), NarEvent::EndDirectory, file(b"escape")], "output/escape")]
+    #[case::after_root_file(vec![file(b""), file(b"escape")], "output/escape")]
+    #[case::second_root(vec![start_dir(b""), NarEvent::EndDirectory, start_dir(b"")], "output")]
+    #[case::after_nested_dir(vec![start_dir(b""), start_dir(b"a"), NarEvent::EndDirectory, file(b"..")], "output/..")]
+    async fn test_restore_rejects_escape(
+        #[case] events: test_data::TestNarEvents,
+        #[case] reported: &str,
+    ) {
         let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
         let path = dir.path().join("output");
 
@@ -585,6 +1104,8 @@ mod unittests {
             .await
             .unwrap_err();
         assert_eq!(err.operation, NarWriteOperation::InvalidEntry);
+        // `Path` equality ignores repeated and trailing slashes.
+        assert_eq!(err.path.as_os_str(), dir.path().join(reported).as_os_str());
 
         // Only the destination itself may exist next to it.
         let siblings: Vec<_> = std::fs::read_dir(dir.path())
@@ -632,6 +1153,55 @@ mod unittests {
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 
+    /// Restore creates each entry in the directory it created, so replacing
+    /// that directory with a symlink doesn't send later entries, or the
+    /// canonical mode, through the symlink.
+    #[tokio::test]
+    #[rstest]
+    async fn test_restore_keeps_its_directories(#[values(false, true)] canonical: bool) {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode();
+        let path = dir.path().join("output");
+        let swap = {
+            let (sub, outside) = (path.join("sub"), outside.clone());
+            async move {
+                while !sub.exists() {
+                    tokio::task::yield_now().await;
+                }
+                std::fs::rename(&sub, sub.with_file_name("moved")).unwrap();
+                std::os::unix::fs::symlink(outside, &sub).unwrap();
+                None
+            }
+        };
+        let events = iter([start_dir(b""), start_dir(b"sub")])
+            .chain(futures_util::stream::once(swap).filter_map(std::future::ready))
+            .chain(iter([
+                file(b"f"),
+                NarEvent::EndDirectory,
+                NarEvent::EndDirectory,
+            ]));
+
+        // Depending on whether the swap comes before or after restore opens
+        // `sub`, restore may fail, but it must not write outside.
+        let _ = RestoreOptions::new()
+            .canonical(canonical)
+            .restore(events.map(Ok::<_, NarWriteError>), &path)
+            .await;
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let after = std::fs::metadata(&outside).unwrap().permissions().mode();
+        assert_eq!(after, mode);
+
+        // Restore may have made its directories read-only, `moved` included.
+        for entry in walkdir::WalkDir::new(&path) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_dir() {
+                std::fs::set_permissions(entry.path(), Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_restore_file_bigger_than_queue() {
         let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
@@ -647,6 +1217,44 @@ mod unittests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), data);
+    }
+
+    /// A file's reader must return exactly `size` bytes, whether it hands
+    /// them out in pieces that `restore` copies, sends as they are, or both.
+    #[tokio::test]
+    #[rstest]
+    #[case::longer(1, 2)]
+    #[case::shorter(2, 1)]
+    #[case::not_empty(0, 1)]
+    #[case::longer_than_chunk(FILE_CHUNK_SIZE, FILE_CHUNK_SIZE + 1)]
+    #[case::shorter_by_chunk(FILE_CHUNK_SIZE + 1, FILE_CHUNK_SIZE)]
+    async fn test_restore_checks_file_size(
+        #[case] size: usize,
+        #[case] len: usize,
+        #[values(1, 100_000, usize::MAX)] piece: usize,
+    ) {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        let data = Bytes::from(vec![0; len]);
+        let pieces: Vec<_> = data
+            .chunks(piece)
+            .map(|chunk| Ok::<_, io::Error>(data.slice_ref(chunk)))
+            .collect();
+        let events = [
+            NarEvent::StartDirectory { name: Bytes::new() },
+            NarEvent::File {
+                name: Bytes::from_static(b"f"),
+                executable: false,
+                size: size as u64,
+                reader: BytesStreamReader::new(iter(pieces)),
+            },
+            NarEvent::EndDirectory,
+        ];
+        let err = restore(iter(events).map(Ok::<_, NarWriteError>), &path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation, NarWriteOperation::InvalidEntry);
+        assert_eq!(err.path, path.join("f"));
     }
 
     #[tokio::test]
@@ -679,20 +1287,165 @@ mod unittests {
         assert!(path.is_dir());
     }
 
-    #[test]
-    fn test_restore_dropped() {
-        // The runtime has one blocking thread and `busy` holds it, so the
-        // writer thread can't start until the test drops the restore future.
+    /// With `canonical`, the umask doesn't change the modes, whether it
+    /// takes no bits off them, some, or all but the owner's.
+    #[tokio::test]
+    #[rstest]
+    async fn test_restore_canonical_umask(#[values(0o022, 0o011, 0o077)] mask: nix::libc::mode_t) {
+        use nix::sys::stat::umask;
+
+        /// Puts the old umask back, even if the test panics.
+        struct Restore(Mode);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                umask(self.0);
+            }
+        }
+
+        let _umask = UMASK.lock().await;
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        let events = test_data::dir_example();
+        let old = Restore(umask(Mode::from_bits_truncate(mask)));
+        let restored = RestoreOptions::new()
+            .canonical(true)
+            .restore(iter(events.clone()).map(Ok::<_, NarWriteError>), &path)
+            .await;
+        drop(old);
+        restored.unwrap();
+
+        // The dump shows which files are executable; `check_canonical` only
+        // checks that each mode is canonical.
+        let dumped = dump(&path)
+            .and_then(NarEvent::read_file)
+            .try_collect::<test_data::TestNarEvents>()
+            .await
+            .unwrap();
+        assert_eq!(dumped, events);
+        check_canonical(&path);
+    }
+
+    /// With `canonical`, a directory that ended is read-only even if the
+    /// restore fails before the next entry.
+    #[tokio::test]
+    async fn test_restore_canonical_after_error() {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        let failed = NarWriteError::create_file_error("stream".into(), io::ErrorKind::Other.into());
+        let events = [
+            start_dir(b""),
+            start_dir(b"done"),
+            file(b"f"),
+            NarEvent::EndDirectory,
+        ];
+        let events = iter(events.map(Ok)).chain(futures_util::stream::once(async { Err(failed) }));
+        let err = RestoreOptions::new()
+            .canonical(true)
+            .restore(events, &path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.path, PathBuf::from("stream"));
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode(&path.join("done")) & 0o777, 0o555);
+        assert_ne!(
+            mode(&path) & 0o200,
+            0,
+            "the root is read-only before it ended"
+        );
+        std::fs::set_permissions(path.join("done"), Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A read error names the file being read. For the root, that is the
+    /// destination itself, without a trailing slash.
+    #[tokio::test]
+    async fn test_restore_read_error_path() {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let broken = |name: &'static [u8]| NarEvent::File {
+            name: Bytes::from_static(name),
+            executable: false,
+            size: 2,
+            reader: BytesStreamReader::new(iter([
+                Ok(Bytes::from_static(b"x")),
+                Err(io::Error::other("broken")),
+            ])),
+        };
+
+        let path = dir.path().join("root");
+        let events = iter([broken(b"")]).map(Ok::<_, NarWriteError>);
+        let err = restore(events, &path).await.unwrap_err();
+        assert_eq!(err.operation, NarWriteOperation::CreateFile);
+        assert_eq!(err.path.as_os_str(), path.as_os_str());
+
+        let path = dir.path().join("nested");
+        let events = [
+            NarEvent::StartDirectory { name: Bytes::new() },
+            broken(b"f"),
+        ];
+        let err = restore(iter(events).map(Ok::<_, NarWriteError>), &path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation, NarWriteOperation::CreateFile);
+        assert_eq!(err.path.as_os_str(), path.join("f").as_os_str());
+    }
+
+    /// `restore` drops a file's name before it reads the file, so that the
+    /// parser can reuse the read buffer the name points into.
+    #[tokio::test]
+    async fn test_restore_drops_name_before_reading() {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        let owner: Arc<[u8]> = Arc::from(&b"f"[..]);
+        let name = Bytes::from_owner(owner.clone());
+        let reader = BytesStreamReader::new(iter(std::iter::once_with(move || {
+            assert_eq!(Arc::strong_count(&owner), 1, "the name is still alive");
+            Ok::<_, io::Error>(Bytes::from_static(b"x"))
+        })));
+        let events = [
+            NarEvent::StartDirectory { name: Bytes::new() },
+            NarEvent::File {
+                name,
+                executable: false,
+                size: 1,
+                reader,
+            },
+            NarEvent::EndDirectory,
+        ];
+        // The case hack, on by default on macOS, keeps every name until its
+        // directory ends.
+        RestoreOptions::new()
+            .use_case_hack(false)
+            .restore(iter(events).map(Ok::<_, NarWriteError>), &path)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(path.join("f")).unwrap(), b"x");
+    }
+
+    /// A runtime with one blocking thread, which the returned task holds
+    /// until the sender sends. Until then, `restore`'s writer thread can't
+    /// start.
+    fn runtime_without_writer() -> (
+        tokio::runtime::Runtime,
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let r = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
             .build()
             .unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let busy = r.spawn_blocking(move || wait.recv().unwrap());
+        (r, release, busy)
+    }
+
+    #[test]
+    fn test_restore_dropped() {
+        // The writer thread can't start until the test drops the restore
+        // future.
+        let (r, release, busy) = runtime_without_writer();
         let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
         let path = dir.path().join("output");
         r.block_on(async {
-            let (release, wait) = std::sync::mpsc::channel::<()>();
-            let busy = spawn_blocking(move || wait.recv().unwrap());
-
             // `restore` queues the work for the whole NAR and then waits on
             // the stream, so `now_or_never` drops it with all of it queued.
             let events = iter(test_data::dir_example())
@@ -709,36 +1462,121 @@ mod unittests {
         assert!(!path.exists());
     }
 
+    /// `restore` sends big pieces of a file to the writer thread as they are,
+    /// and copies short ones unless a short one is the rest of the file.
     #[test]
-    fn test_restore_data_budget() {
+    fn test_restore_forwards_big_pieces() {
+        let (r, release, busy) = runtime_without_writer();
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        // A chunk is alive while its owner has more than one reference.
+        let owners: Vec<Arc<[u8]>> = [10_000, FILE_CHUNK_SIZE, 20_000]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| Arc::from(vec![i as u8; len]))
+            .collect();
+        let chunks: Vec<_> = owners
+            .iter()
+            .map(|owner| Ok(Bytes::from_owner(owner.clone())))
+            .collect();
+        let events = iter([NarEvent::File {
+            name: Bytes::new(),
+            executable: false,
+            size: owners.iter().map(|owner| owner.len() as u64).sum(),
+            reader: BytesStreamReader::new(iter(chunks)),
+        }]);
+        r.block_on(async {
+            let mut restored = std::pin::pin!(restore(events.map(Ok::<_, NarWriteError>), &path));
+            assert!(restored.as_mut().now_or_never().is_none());
+            let alive: Vec<_> = owners.iter().map(|o| Arc::strong_count(o) > 1).collect();
+            assert_eq!(alive, [false, true, true]);
+
+            release.send(()).unwrap();
+            busy.await.unwrap();
+            restored.await.unwrap();
+        });
+        assert!(owners.iter().all(|owner| Arc::strong_count(owner) == 1));
+        assert_eq!(std::fs::read(&path).unwrap(), owners.concat());
+    }
+
+    /// `write_all_vectored` goes on after short and interrupted writes.
+    #[test]
+    fn test_write_all_vectored() {
+        /// Takes at most 4 bytes per write, and fails every other write as
+        /// interrupted.
+        #[derive(Default)]
+        struct Slow {
+            written: Vec<u8>,
+            interrupt: bool,
+        }
+        impl Write for Slow {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.write_vectored(&[IoSlice::new(buf)])
+            }
+            fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+                self.interrupt = !self.interrupt;
+                if self.interrupt {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let before = self.written.len();
+                for buf in bufs {
+                    let room = 4 - (self.written.len() - before);
+                    self.written.extend_from_slice(&buf[..buf.len().min(room)]);
+                }
+                Ok(self.written.len() - before)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let data: [&[u8]; 5] = [b"", b"hello", b"", b" wor", b"ld!"];
+        let mut bufs = data.map(IoSlice::new);
+        let mut out = Slow::default();
+        write_all_vectored(&mut out, &mut bufs).unwrap();
+        assert_eq!(out.written, b"hello world!");
+    }
+
+    /// `restore` reads one chunk past the budget and then waits for the
+    /// writer thread instead of reading all 8 MiB. It does so whether it
+    /// sends the reader's pieces as they are or copies them.
+    #[rstest]
+    #[case::forwarded(true)]
+    #[case::copied(false)]
+    fn test_restore_data_budget(#[case] forwarded: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // The runtime has one blocking thread and `busy` holds it, so the
-        // writer thread takes nothing from the queue while `restore` runs.
-        let r = tokio::runtime::Builder::new_current_thread()
-            .max_blocking_threads(1)
-            .build()
-            .unwrap();
+        // The writer thread takes nothing from the queue while `restore` runs.
+        let (r, release, busy) = runtime_without_writer();
         let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
         let path = dir.path().join("output");
         let read = Arc::new(AtomicUsize::new(0));
         r.block_on(async {
-            let (release, wait) = std::sync::mpsc::channel::<()>();
-            let busy = spawn_blocking(move || wait.recv().unwrap());
-
-            // The file says it is empty, but its reader returns 8 MiB.
-            let data = std::io::Cursor::new(vec![0; 4 * DATA_IN_FLIGHT]);
-            let counted = tokio_util::io::InspectReader::new(data, {
+            let count = {
                 let read = read.clone();
                 move |buf: &[u8]| {
                     read.fetch_add(buf.len(), Ordering::Relaxed);
                 }
-            });
+            };
+            // The reader returns 8 MiB, in chunks that `restore` sends as
+            // they are, or in reads short enough that it copies them.
+            let reader: Box<dyn AsyncBytesRead + Send + Unpin> = if forwarded {
+                let chunks =
+                    futures_util::stream::repeat_with(|| Bytes::from(vec![0; FILE_CHUNK_SIZE]))
+                        .take(4 * DATA_IN_FLIGHT / FILE_CHUNK_SIZE)
+                        .inspect(move |chunk| count(chunk))
+                        .map(Ok);
+                Box::new(BytesStreamReader::new(chunks))
+            } else {
+                let data = std::io::Cursor::new(vec![0; 4 * DATA_IN_FLIGHT]);
+                Box::new(BytesReader::new(tokio_util::io::InspectReader::new(
+                    data, count,
+                )))
+            };
             let events = iter([NarEvent::File {
                 name: Bytes::new(),
                 executable: false,
-                size: 0,
-                reader: tokio::io::BufReader::new(counted),
+                size: 4 * DATA_IN_FLIGHT as u64,
+                reader,
             }]);
             let restored = restore(events.map(Ok::<_, NarWriteError>), &path);
             assert!(restored.now_or_never().is_none());
@@ -747,8 +1585,6 @@ mod unittests {
             busy.await.unwrap();
             spawn_blocking(|| ()).await.unwrap();
         });
-        // `restore` reads one chunk past the budget and then waits for the
-        // writer thread. If it trusted `size`, it would read all 8 MiB.
         assert!(read.load(Ordering::Relaxed) < 2 * DATA_IN_FLIGHT);
     }
 }

@@ -120,15 +120,13 @@ where
     R: AsyncBytesRead + Unpin,
 {
     fn poll_force_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
-        let this = self.get_mut();
-        if let Some(inner) = this.inner.as_mut() {
-            let buf = ready!(Pin::new(&mut inner.reader).poll_fill_buf(cx))?;
-            if !buf.is_empty() {
-                return Poll::Ready(Ok(buf));
-            }
+        match self.get_mut().inner.as_mut() {
+            Some(inner) => Pin::new(&mut inner.reader).poll_force_fill_buf(cx),
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF while force reading",
+            ))),
         }
-        this.return_reader();
-        Poll::Ready(Ok(Bytes::new()))
     }
 
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
