@@ -86,6 +86,10 @@ where
 /// where the parser's buffer ends, so read each file to the end or drop it
 /// before asking for the next event. A slice keeps the buffer or chunk it
 /// came from alive until it is dropped.
+///
+/// Besides [`AsyncRead`] and [`AsyncBufRead`], it implements
+/// [`AsyncBytesRead`], whose `poll_fill_buf` hands out the next part of the
+/// contents as a slice of the parser's buffer or chunk instead of a copy.
 pub struct ParsedFile<R>(Either<Cursor<Bytes>, AsyncBufReadCompat<LentReader<PaddedReader<R>>>>);
 
 impl<R> AsyncRead for ParsedFile<R>
@@ -111,6 +115,39 @@ where
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
         Pin::new(&mut self.get_mut().0).consume(amt)
+    }
+}
+
+impl<R> ParsedFile<R>
+where
+    R: AsyncBytesRead + Unpin,
+{
+    fn contents(self: Pin<&mut Self>) -> Pin<&mut (dyn AsyncBytesRead + Unpin + '_)> {
+        match &mut self.get_mut().0 {
+            Either::Left(buffered) => Pin::new(buffered),
+            Either::Right(lent) => Pin::new(lent),
+        }
+    }
+}
+
+impl<R> AsyncBytesRead for ParsedFile<R>
+where
+    R: AsyncBytesRead + Unpin,
+{
+    fn poll_force_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        self.contents().poll_force_fill_buf(cx)
+    }
+
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        self.contents().poll_fill_buf(cx)
+    }
+
+    fn prepare(self: Pin<&mut Self>, additional: usize) {
+        self.contents().prepare(additional)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        self.contents().consume(amt)
     }
 }
 
@@ -330,6 +367,46 @@ mod unittests {
             .await
     }
 
+    /// Reads `reader` to the end through [`AsyncBytesRead`].
+    async fn read_pieces<R: AsyncBytesRead + Unpin>(reader: &mut R) -> io::Result<Vec<Bytes>> {
+        let mut pieces = Vec::new();
+        loop {
+            let piece = std::future::poll_fn(|cx| Pin::new(&mut *reader).poll_fill_buf(cx)).await?;
+            if piece.is_empty() {
+                return Ok(pieces);
+            }
+            Pin::new(&mut *reader).consume(piece.len());
+            pieces.push(piece);
+        }
+    }
+
+    /// Like [`read_nar_stream`], but reads files through [`AsyncBytesRead`].
+    async fn read_nar_stream_bytes(
+        nar: Bytes,
+        sizes: &[usize],
+    ) -> io::Result<test_data::TestNarEvents> {
+        parse_nar_stream(chunked(nar, sizes))
+            .and_then(async |event| match event {
+                NarEvent::File {
+                    name,
+                    executable,
+                    size,
+                    mut reader,
+                } => {
+                    let contents = read_pieces(&mut reader).await?.concat();
+                    Ok(NarEvent::File {
+                        name,
+                        executable,
+                        size,
+                        reader: Cursor::new(Bytes::from(contents)),
+                    })
+                }
+                other => other.read_file().await,
+            })
+            .try_collect()
+            .await
+    }
+
     #[tokio::test]
     #[rstest]
     #[case::dir_example("test-data/test-dir.nar", test_data::dir_example())]
@@ -522,7 +599,11 @@ mod unittests {
             let reader = BytesReader::new(test_data::Chunked::new(nar.clone(), chunk_size));
             let err = crate::parse_nar_listing(reader).await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}");
-            let err = read_nar_stream(nar, &[chunk_size]).await.unwrap_err();
+            let err = read_nar_stream(nar.clone(), &[chunk_size])
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}");
+            let err = read_nar_stream_bytes(nar, &[chunk_size]).await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}");
         }
     }
@@ -544,8 +625,104 @@ mod unittests {
         let contents = write_nar(events.iter());
         let actual = read_nar(Cursor::new(contents.clone())).await.unwrap();
         assert_eq!(events, actual);
-        let actual = read_nar_stream(contents, &[chunk_size]).await.unwrap();
+        let actual = read_nar_stream(contents.clone(), &[chunk_size])
+            .await
+            .unwrap();
         assert_eq!(events, actual);
+        let actual = read_nar_stream_bytes(contents, &[chunk_size])
+            .await
+            .unwrap();
+        assert_eq!(events, actual);
+    }
+
+    /// Pieces read through [`AsyncBytesRead`] are slices of the chunks the
+    /// NAR came in, whether the parser buffered the file or lent it its
+    /// reader.
+    #[tokio::test]
+    async fn file_bytes_are_not_copied() {
+        use futures_util::StreamExt as _;
+
+        // The size is a multiple of 8, so reading the end of the contents
+        // needs no join.
+        let big = Bytes::from_iter((0..100_000u32).map(|i| i as u8));
+        let file = |name: &'static [u8], contents: &Bytes| NarEvent::File {
+            name: Bytes::from_static(name),
+            executable: false,
+            size: contents.len() as u64,
+            reader: Cursor::new(contents.clone()),
+        };
+        let small = Bytes::from_static(b"small");
+        let events = [
+            NarEvent::StartDirectory { name: Bytes::new() },
+            file(b"big", &big),
+            file(b"small", &small),
+            NarEvent::EndDirectory,
+        ];
+        let nar = write_nar(events.iter());
+        let chunks: Vec<_> = nar.chunks(16 * 1024).map(Bytes::copy_from_slice).collect();
+        let in_a_chunk = |piece: &Bytes| {
+            let piece = piece.as_ptr_range();
+            chunks.iter().any(|chunk| {
+                let chunk = chunk.as_ptr_range();
+                chunk.start <= piece.start && piece.end <= chunk.end
+            })
+        };
+
+        let mut parser = pin!(parse_nar_stream(stream::iter(chunks.clone()).map(Ok)));
+        let mut files = Vec::new();
+        while let Some(event) = parser.try_next().await.unwrap() {
+            if let NarEvent::File {
+                name, mut reader, ..
+            } = event
+            {
+                let lent = matches!(reader.0, Either::Right(_));
+                let pieces = read_pieces(&mut reader).await.unwrap();
+                assert!(pieces.iter().all(in_a_chunk), "{name:?} was copied");
+                files.push((name, lent, Bytes::from(pieces.concat())));
+            }
+        }
+        assert_eq!(
+            files,
+            [
+                (Bytes::from_static(b"big"), true, big),
+                (Bytes::from_static(b"small"), false, small),
+            ]
+        );
+    }
+
+    /// A force fill on a lent file reads more of it, instead of handing out
+    /// the same bytes again.
+    #[tokio::test]
+    async fn lent_file_force_fill_reads_more() {
+        use futures_util::StreamExt as _;
+
+        let contents = Bytes::from(vec![7u8; 64]);
+        let events = [NarEvent::File {
+            name: Bytes::new(),
+            executable: false,
+            size: contents.len() as u64,
+            reader: Cursor::new(contents.clone()),
+        }];
+        let nar = write_nar(events.iter());
+        let chunks: Vec<_> = nar.chunks(16).map(Bytes::copy_from_slice).collect();
+        let mut parser = pin!(parse_nar_stream(stream::iter(chunks).map(Ok)));
+        let Some(NarEvent::File { mut reader, .. }) = parser.try_next().await.unwrap() else {
+            panic!("expected a file");
+        };
+        assert!(matches!(reader.0, Either::Right(_)));
+        let first =
+            std::future::poll_fn(|cx| AsyncBytesRead::poll_fill_buf(Pin::new(&mut reader), cx))
+                .await
+                .unwrap();
+        let more = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_force_fill_buf(cx))
+            .await
+            .unwrap();
+        assert!(
+            more.len() > first.len(),
+            "{} <= {}",
+            more.len(),
+            first.len()
+        );
     }
 
     /// Wherever the chunks start and end, the stream parses to the events
@@ -560,7 +737,9 @@ mod unittests {
             sizes in prop::collection::vec(1..256usize, 1..16),
         )| {
             let nar = write_nar(events.iter());
-            let actual = rt.block_on(read_nar_stream(nar, &sizes))?;
+            let actual = rt.block_on(read_nar_stream(nar.clone(), &sizes))?;
+            prop_assert_eq!(&actual, &events);
+            let actual = rt.block_on(read_nar_stream_bytes(nar, &sizes))?;
             prop_assert_eq!(actual, events);
         });
     }

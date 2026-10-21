@@ -3,7 +3,7 @@ use std::ops::DerefMut;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use tokio::io::AsyncRead;
 
 pub trait AsyncBytesRead: AsyncRead {
@@ -77,10 +77,9 @@ impl AsyncBytesRead for io::Cursor<Bytes> {
     }
 
     fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
-        let pos = self.position();
-        let mut buf = self.get_ref().clone();
-        buf.advance(pos as usize);
-        Poll::Ready(Ok(buf))
+        // At the end, `slice` returns an empty `Bytes` without touching the
+        // reference count.
+        Poll::Ready(Ok(self.get_ref().slice(self.position() as usize..)))
     }
 
     fn prepare(self: Pin<&mut Self>, _additional: usize) {}
