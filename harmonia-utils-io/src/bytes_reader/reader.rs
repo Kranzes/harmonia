@@ -47,6 +47,7 @@ impl BytesReaderBuilder {
             reserved_buf_size: self.reserved_buf_size,
             max_buf_size: self.max_buf_size,
             buf,
+            view: None,
         }
     }
 }
@@ -57,6 +58,12 @@ pin_project! {
         #[pin]
         inner: R,
         buf: BufferMut,
+        // A `Bytes` over the filled part of `buf`. `poll_fill_buf` hands out
+        // clones of it instead of building a new `Bytes` on every call. When
+        // set, it covers exactly the bytes in `buf`. Clear it before reading
+        // into `buf`, which makes it stale, and before growing `buf`, which
+        // can't reuse its allocation while this is alive.
+        view: Option<Bytes>,
         reserved_buf_size: usize,
         max_buf_size: usize,
     }
@@ -80,6 +87,7 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<std::io::Result<usize>> {
+        *self.as_mut().project().view = None;
         // Ensure that buffer has space for at least reserved_buf_size bytes
         let reserved_buf_size = self.reserved_buf_size;
         if self.remaining_mut() < reserved_buf_size {
@@ -146,6 +154,11 @@ impl<R> BytesReader<R> {
         self.buf.filled()
     }
 
+    fn view(self: Pin<&mut Self>) -> Bytes {
+        let me = self.project();
+        me.view.get_or_insert_with(|| me.buf.filled()).clone()
+    }
+
     /// Remaining capacity in internal buffer
     pub fn remaining_mut(&self) -> usize {
         self.buf.capacity() - self.buf.len()
@@ -180,7 +193,7 @@ where
                 "EOF while force reading",
             )))
         } else {
-            Poll::Ready(Ok(self.filled()))
+            Poll::Ready(Ok(self.view()))
         }
     }
 
@@ -191,20 +204,39 @@ where
         if self.buf.is_empty() {
             ready!(self.as_mut().poll_force_fill_buf_internal(cx))?;
         }
-        Poll::Ready(Ok(self.filled()))
+        Poll::Ready(Ok(self.view()))
     }
 
     fn prepare(self: std::pin::Pin<&mut Self>, additional: usize) {
         let me = self.project();
-        let len = me.buf.len() + me.buf.len();
-        if additional > len && me.buf.capacity() + additional < *me.max_buf_size {
-            me.buf.reserve(additional - len);
+        let len = me.buf.len();
+        // Also reserve the spare room `poll_force_fill_buf` requires before
+        // each read, so reading the rest of the string doesn't grow the
+        // buffer again.
+        let reserved = *me.reserved_buf_size;
+        // `additional` comes from a length on the wire, so a total that
+        // doesn't fit in `usize` is over `max_buf_size` as well.
+        let fits = me
+            .buf
+            .capacity()
+            .checked_add(additional)
+            .and_then(|total| total.checked_add(reserved))
+            .is_some_and(|total| total < *me.max_buf_size);
+        if additional > len && fits {
+            let wanted = additional - len + reserved;
+            if me.buf.capacity() - len < wanted {
+                *me.view = None;
+                me.buf.reserve(wanted);
+            }
         }
     }
 
     fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
         let me = self.project();
         me.buf.advance(amt);
+        if let Some(view) = me.view {
+            view.advance(amt);
+        }
     }
 }
 
@@ -229,11 +261,121 @@ where
 
 #[cfg(test)]
 mod unittests {
+    use std::future::poll_fn;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use bytes::Bytes;
     use hex_literal::hex;
-    use tokio::io::AsyncReadExt as _;
+    use proptest::prelude::*;
+    use proptest::sample::Index;
+    use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
     use tokio_test::io::Builder;
 
-    use crate::{BytesReader, TryReadBytesLimited, TryReadU64};
+    use crate::{AsyncBytesRead as _, BytesReader, TryReadBytesLimited, TryReadU64};
+
+    /// The cached view of the filled bytes must not stop the buffer from
+    /// reusing its allocation once everything in it is consumed.
+    #[tokio::test]
+    async fn test_reuses_buffer_after_consume() {
+        let mock = Builder::new()
+            .read(b"abcdefgh")
+            .read(b"ijklmnop")
+            .read(b"qrstuvwx")
+            .build();
+        // The buffer starts with room for exactly the first two reads.
+        let mut reader = BytesReader::builder().set_reserved_buf_size(8).build(mock);
+
+        let start = reader.force_fill().await.unwrap().as_ptr();
+        Pin::new(&mut reader).consume(8);
+        reader.force_fill().await.unwrap();
+        Pin::new(&mut reader).consume(8);
+        assert_eq!(reader.force_fill().await.unwrap().as_ptr(), start);
+    }
+
+    /// Returns at most `chunk` bytes per read.
+    struct Chunked {
+        data: Bytes,
+        chunk: usize,
+    }
+
+    impl AsyncRead for Chunked {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let n = self.chunk.min(self.data.len()).min(buf.remaining());
+            buf.put_slice(&self.data.split_to(n));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Fill,
+        ForceFill,
+        Consume(Index),
+        Prepare(usize),
+    }
+
+    /// In any order of calls, every `Bytes` the reader hands out is its
+    /// current buffer, and the buffer holds the next unconsumed part of the
+    /// stream.
+    #[test]
+    fn proptest_buffer_matches_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        proptest!(|(
+            data in prop::collection::vec(any::<u8>(), 0..512),
+            chunk in 1..64usize,
+            ops in prop::collection::vec(prop_oneof![
+                Just(Op::Fill),
+                Just(Op::ForceFill),
+                any::<Index>().prop_map(Op::Consume),
+                (0..256usize).prop_map(Op::Prepare),
+            ], 0..64),
+        )| {
+            rt.block_on(async {
+                let source = Chunked { data: Bytes::from(data.clone()), chunk };
+                let mut reader = BytesReader::builder().set_reserved_buf_size(16).build(source);
+                let mut pos = 0;
+                for op in ops {
+                    match op {
+                        Op::Fill => {
+                            let buf = poll_fn(|cx| Pin::new(&mut reader).poll_fill_buf(cx)).await?;
+                            prop_assert!(std::ptr::eq(&buf[..], reader.buffer()));
+                            prop_assert!(!buf.is_empty() || pos == data.len());
+                        }
+                        Op::ForceFill => {
+                            let before = reader.buffer().len();
+                            match reader.force_fill().await {
+                                Ok(buf) => {
+                                    prop_assert!(std::ptr::eq(&buf[..], reader.buffer()));
+                                    prop_assert!(buf.len() > before);
+                                }
+                                Err(err) => {
+                                    prop_assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+                                    prop_assert_eq!(pos + before, data.len());
+                                }
+                            }
+                        }
+                        Op::Consume(amt) => {
+                            let amt = amt.index(reader.buffer().len() + 1);
+                            Pin::new(&mut reader).consume(amt);
+                            pos += amt;
+                        }
+                        Op::Prepare(additional) => Pin::new(&mut reader).prepare(additional),
+                    }
+                    let buffered = reader.buffer();
+                    prop_assert_eq!(buffered, &data[pos..pos + buffered.len()]);
+                }
+                Ok::<_, TestCaseError>(())
+            })?;
+        });
+    }
 
     #[tokio::test]
     async fn test_read_u64_partial() {
@@ -278,6 +420,44 @@ mod unittests {
         assert_eq!(4, n1);
         assert_eq!(hex!("0123 4567 89AB CDEF 0100 0000"), buf);
         assert_eq!(0, reader.read(&mut buf[..]).await.unwrap());
+    }
+
+    /// After `prepare(n)`, reading until the buffer holds `n` bytes must not
+    /// grow it again. `n` counts the bytes already buffered.
+    #[tokio::test]
+    async fn test_prepare_reserves_whole_string() {
+        let mut mock = Builder::new();
+        mock.read(&[1; 12]);
+        for _ in 0..7 {
+            mock.read(&[2; 4]);
+        }
+        let mut reader = BytesReader::builder()
+            .set_reserved_buf_size(8)
+            .build(mock.build());
+        assert_eq!(reader.force_fill().await.unwrap().len(), 12);
+
+        Pin::new(&mut reader).prepare(40);
+        let start = reader.buffer().as_ptr();
+        while reader.buffer().len() < 40 {
+            reader.force_fill().await.unwrap();
+        }
+        assert_eq!(reader.buffer().as_ptr(), start);
+    }
+
+    /// A length near `usize::MAX` from the wire must not overflow `prepare`'s
+    /// size check. It is over `max_buf_size`, so nothing gets reserved.
+    #[tokio::test]
+    async fn test_prepare_huge_length() {
+        let mut mock = Builder::new();
+        mock.read(&[1; 12]);
+        let mut reader = BytesReader::new(mock.build());
+        assert_eq!(reader.force_fill().await.unwrap().len(), 12);
+
+        let capacity = reader.buf.capacity();
+        for additional in [usize::MAX, usize::MAX - 4] {
+            Pin::new(&mut reader).prepare(additional);
+            assert_eq!(reader.buf.capacity(), capacity);
+        }
     }
 
     #[tokio::test]
