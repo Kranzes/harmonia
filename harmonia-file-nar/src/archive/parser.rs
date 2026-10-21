@@ -1,11 +1,12 @@
-use std::io;
+use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes};
 use futures_core::Stream;
 use pin_project_lite::pin_project;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+use tokio_util::either::Either;
 use tracing::trace;
 
 use crate::ByteString;
@@ -78,19 +79,55 @@ where
     }
 }
 
-type ParsedReader<R> = AsyncBufReadCompat<LentReader<PaddedReader<R>>>;
+/// The contents of a file from [`NarParser`].
+///
+/// When the parser already holds all of the contents, this is a slice of
+/// them. Otherwise it reads them from the NAR, and the parser waits until
+/// this reader is read to the end or dropped. Which one a file gets depends on
+/// where the parser's buffer ends, so read each file to the end or drop it
+/// before asking for the next event. A slice keeps the buffer or chunk it
+/// came from alive until it is dropped.
+pub struct ParsedFile<R>(Either<Cursor<Bytes>, AsyncBufReadCompat<LentReader<PaddedReader<R>>>>);
+
+impl<R> AsyncRead for ParsedFile<R>
+where
+    R: AsyncBytesRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl<R> AsyncBufRead for ParsedFile<R>
+where
+    R: AsyncBytesRead + Unpin,
+{
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        Pin::new(&mut self.get_mut().0).poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        Pin::new(&mut self.get_mut().0).consume(amt)
+    }
+}
+
 impl<R> Stream for NarParser<R>
 where
     R: AsyncBytesRead + Unpin,
 {
-    type Item = io::Result<NarEvent<ParsedReader<R>>>;
+    type Item = io::Result<NarEvent<ParsedFile<R>>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
         let mut reader = ready!(this.reader.as_mut().poll_reader(cx))?;
         match this.state.state {
             InnerState::ReadContents(NodeType::ExecutableFile | NodeType::File, size, _) => {
-                // The file's reader has drained the contents and their padding.
+                // The contents and their padding have been consumed, by the
+                // parser or by the file's reader.
                 *this.position = this.position.saturating_add(calc_aligned(size));
                 this.state.bump_next();
             }
@@ -123,15 +160,30 @@ where
                 InnerState::ReadContents(
                     node_type @ (NodeType::ExecutableFile | NodeType::File),
                     size,
-                    _,
+                    aligned,
                 ) => {
-                    let reader = this.reader.lend(|r| PaddedReader::new(r, size));
+                    // When the contents are already buffered, hand them out
+                    // instead of lending the reader. Checking `size` as well
+                    // rules out an `aligned` that wrapped around. With bad
+                    // padding the parser lends its reader anyway, so that the
+                    // file's reader fails and so does every later poll.
+                    let buffered = buf.len() as u64;
+                    let in_buf = size <= buffered && aligned <= buffered;
+                    let (len, aligned) = (size as usize, aligned as usize);
+                    let contents = if in_buf && check_padding(&buf[len..aligned]).is_ok() {
+                        reader.as_mut().consume(aligned);
+                        buf.truncate(len);
+                        Either::Left(Cursor::new(buf))
+                    } else {
+                        let reader = this.reader.lend(|r| PaddedReader::new(r, size));
+                        Either::Right(AsyncBufReadCompat::new(reader))
+                    };
                     let name = this.name.take().unwrap_or_default();
                     return Poll::Ready(Some(Ok(NarEvent::File {
                         name,
                         executable: node_type == NodeType::ExecutableFile,
                         size,
-                        reader: AsyncBufReadCompat::new(reader),
+                        reader: ParsedFile(contents),
                     })));
                 }
                 InnerState::ReadContents(NodeType::Symlink, len, aligned) => {
@@ -207,7 +259,7 @@ where
 
 pub fn parse_nar<R>(
     reader: R,
-) -> impl Stream<Item = io::Result<NarEvent<ParsedReader<BytesReader<R>>>>>
+) -> impl Stream<Item = io::Result<NarEvent<ParsedFile<BytesReader<R>>>>>
 where
     R: AsyncRead + Unpin,
 {
@@ -222,7 +274,7 @@ where
 /// whole chunk in memory.
 pub fn parse_nar_stream<S>(
     stream: S,
-) -> impl Stream<Item = io::Result<NarEvent<ParsedReader<BytesStreamReader<S>>>>>
+) -> impl Stream<Item = io::Result<NarEvent<ParsedFile<BytesStreamReader<S>>>>>
 where
     S: Stream<Item = io::Result<Bytes>> + Unpin,
 {
@@ -245,6 +297,7 @@ where
 mod unittests {
     use std::io::{self, Cursor};
     use std::path::PathBuf;
+    use std::pin::pin;
 
     use bytes::Bytes;
 
@@ -253,7 +306,7 @@ mod unittests {
     use rstest::rstest;
     use tokio::fs::File;
 
-    use crate::archive::read_nar::{TOK_DIR, TOK_ENTRY, TOK_ROOT, TOK_SYM};
+    use crate::archive::read_nar::{TOK_DIR, TOK_ENTRY, TOK_FILE, TOK_PAR, TOK_ROOT, TOK_SYM};
     use crate::archive::{test_data, write_nar};
     use crate::test::arbitrary::archive::arb_nar_events;
 
@@ -304,6 +357,74 @@ mod unittests {
 
         let err = read_nar(Cursor::new(nar)).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A file size near `u64::MAX` must fail as a short NAR, not panic.
+    #[tokio::test]
+    async fn huge_file_size() {
+        let mut nar = [TOK_ROOT, TOK_FILE].concat();
+        nar.extend_from_slice(&u64::MAX.to_le_bytes());
+        nar.extend_from_slice(&[0u8; 64]);
+        let err = read_nar(Cursor::new(nar)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// After bad padding behind a file, the parser keeps failing. It must not
+    /// read the file's contents, here a ")" token, as the rest of the NAR.
+    #[tokio::test]
+    async fn bad_padding_after_file_keeps_failing() {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let contents = [TOK_PAR, b"x"].concat();
+        let events = [NarEvent::File {
+            name: Bytes::new(),
+            executable: false,
+            size: contents.len() as u64,
+            reader: Cursor::new(Bytes::from(contents.clone())),
+        }];
+        let mut nar = Vec::from(write_nar(events.iter()));
+        let at = nar
+            .windows(contents.len())
+            .position(|w| w == contents)
+            .unwrap();
+        nar[at + contents.len()] = 1;
+
+        let mut parser = pin!(parse_nar(Cursor::new(nar)));
+        let mut failed = false;
+        for _ in 0..3 {
+            match parser.next().await {
+                Some(Ok(NarEvent::File { mut reader, .. })) if !failed => {
+                    failed = reader.read_to_end(&mut Vec::new()).await.is_err();
+                }
+                Some(Err(err)) => {
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                    failed = true;
+                }
+                other => panic!("expected an error, got {:?}", other.map(|e| e.is_ok())),
+            }
+        }
+        assert!(failed);
+    }
+
+    /// The parser goes on while the reader of a file it already buffered is
+    /// still alive.
+    #[tokio::test]
+    async fn buffered_file_does_not_block_parser() {
+        use futures_util::{FutureExt as _, StreamExt as _};
+        use tokio::io::AsyncReadExt as _;
+
+        let nar = write_nar(test_data::text_file().iter());
+        let mut parser = pin!(parse_nar(Cursor::new(nar)));
+        let Some(Ok(NarEvent::File { mut reader, .. })) = parser.next().await else {
+            panic!("expected a file");
+        };
+        let next = parser.next().now_or_never().expect("the parser waited");
+        assert!(next.is_none());
+
+        let mut contents = String::new();
+        reader.read_to_string(&mut contents).await.unwrap();
+        assert_eq!(contents, "Hello world!");
     }
 
     /// Build a NAR of a directory containing one empty file per name.
