@@ -41,7 +41,8 @@ impl BytesReaderBuilder {
     }
 
     pub fn build<R>(self, reader: R) -> BytesReader<R> {
-        let buf = BufferMut::with_capacity(self.reserved_buf_size * 2);
+        let size = self.reserved_buf_size.saturating_mul(2);
+        let buf = BufferMut::with_capacity(size.min(self.max_buf_size));
         BytesReader {
             inner: reader,
             reserved_buf_size: self.reserved_buf_size,
@@ -84,16 +85,22 @@ where
     }
 
     fn poll_force_fill_buf_internal(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<std::io::Result<usize>> {
-        *self.as_mut().project().view = None;
-        // Ensure that buffer has space for at least reserved_buf_size bytes
-        let reserved_buf_size = self.reserved_buf_size;
-        if self.remaining_mut() < reserved_buf_size {
-            self.as_mut().reserve(reserved_buf_size)?;
-        }
         let me = self.project();
+        *me.view = None;
+        // Make room for `reserved_buf_size` bytes, or for as many as
+        // `max_buf_size` still allows. Fail only if that is none.
+        if me.buf.remaining_mut() < *me.reserved_buf_size {
+            me.buf.reserve(*me.reserved_buf_size, *me.max_buf_size);
+            if me.buf.remaining_mut() == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("buffer is full at {} bytes", me.buf.len()),
+                )));
+            }
+        }
         let n = {
             let dst = me.buf.spare_capacity_mut();
             let mut buf = ReadBuf::uninit(dst);
@@ -163,19 +170,6 @@ impl<R> BytesReader<R> {
     pub fn remaining_mut(&self) -> usize {
         self.buf.capacity() - self.buf.len()
     }
-
-    fn reserve(self: std::pin::Pin<&mut Self>, additional: usize) -> io::Result<()> {
-        let me = self.project();
-        me.buf.reserve(additional);
-        if me.buf.capacity() > *me.max_buf_size {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("buffer {} is too large", me.buf.capacity()),
-            ))
-        } else {
-            Ok(())
-        }
-    }
 }
 
 impl<R> AsyncBytesRead for BytesReader<R>
@@ -216,17 +210,14 @@ where
         let reserved = *me.reserved_buf_size;
         // `additional` comes from a length on the wire, so a total that
         // doesn't fit in `usize` is over `max_buf_size` as well.
-        let fits = me
-            .buf
-            .capacity()
-            .checked_add(additional)
-            .and_then(|total| total.checked_add(reserved))
-            .is_some_and(|total| total < *me.max_buf_size);
+        let fits = additional
+            .checked_add(reserved)
+            .is_some_and(|total| total <= *me.max_buf_size);
         if additional > len && fits {
             let wanted = additional - len + reserved;
             if me.buf.capacity() - len < wanted {
                 *me.view = None;
-                me.buf.reserve(wanted);
+                me.buf.reserve(wanted, *me.max_buf_size);
             }
         }
     }
@@ -318,11 +309,12 @@ mod unittests {
         ForceFill,
         Consume(Index),
         Prepare(usize),
+        Release,
     }
 
     /// In any order of calls, every `Bytes` the reader hands out is its
-    /// current buffer, and the buffer holds the next unconsumed part of the
-    /// stream.
+    /// current buffer and keeps its contents. The buffer holds the next
+    /// unconsumed part of the stream and never grows past `max_buf_size`.
     #[test]
     fn proptest_buffer_matches_stream() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -331,23 +323,32 @@ mod unittests {
         proptest!(|(
             data in prop::collection::vec(any::<u8>(), 0..512),
             chunk in 1..64usize,
+            max in 1..1024usize,
             ops in prop::collection::vec(prop_oneof![
                 Just(Op::Fill),
                 Just(Op::ForceFill),
                 any::<Index>().prop_map(Op::Consume),
                 (0..256usize).prop_map(Op::Prepare),
+                Just(Op::Release),
             ], 0..64),
         )| {
             rt.block_on(async {
                 let source = Chunked { data: Bytes::from(data.clone()), chunk };
-                let mut reader = BytesReader::builder().set_reserved_buf_size(16).build(source);
+                let mut reader = BytesReader::builder()
+                    .set_reserved_buf_size(16)
+                    .set_max_buf_size(max)
+                    .build(source);
                 let mut pos = 0;
+                // The last `Bytes` handed out, which shares the buffer until
+                // released, and where it starts in the stream.
+                let mut held = None;
                 for op in ops {
                     match op {
                         Op::Fill => {
                             let buf = poll_fn(|cx| Pin::new(&mut reader).poll_fill_buf(cx)).await?;
                             prop_assert!(std::ptr::eq(&buf[..], reader.buffer()));
                             prop_assert!(!buf.is_empty() || pos == data.len());
+                            held = Some((pos, buf));
                         }
                         Op::ForceFill => {
                             let before = reader.buffer().len();
@@ -355,6 +356,10 @@ mod unittests {
                                 Ok(buf) => {
                                     prop_assert!(std::ptr::eq(&buf[..], reader.buffer()));
                                     prop_assert!(buf.len() > before);
+                                    held = Some((pos, buf));
+                                }
+                                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                                    prop_assert_eq!(before, max);
                                 }
                                 Err(err) => {
                                     prop_assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
@@ -368,9 +373,14 @@ mod unittests {
                             pos += amt;
                         }
                         Op::Prepare(additional) => Pin::new(&mut reader).prepare(additional),
+                        Op::Release => held = None,
                     }
                     let buffered = reader.buffer();
                     prop_assert_eq!(buffered, &data[pos..pos + buffered.len()]);
+                    prop_assert!(reader.buffer_capacity() <= max);
+                    if let Some((start, buf)) = &held {
+                        prop_assert_eq!(&buf[..], &data[*start..*start + buf.len()]);
+                    }
                 }
                 Ok::<_, TestCaseError>(())
             })?;
@@ -460,6 +470,77 @@ mod unittests {
         }
     }
 
+    /// `prepare` reserves room for any string that fits in `max_buf_size`
+    /// with `reserved_buf_size` to spare, whatever the buffer's capacity.
+    #[tokio::test]
+    async fn test_prepare_up_to_max_buf_size() {
+        let mut mock = Builder::new();
+        mock.read(&[1; 12]);
+        for _ in 0..3 {
+            mock.read(&[2; 4]);
+        }
+        let mut reader = BytesReader::builder()
+            .set_reserved_buf_size(8)
+            .set_max_buf_size(32)
+            .build(mock.build());
+        assert_eq!(reader.force_fill().await.unwrap().len(), 12);
+
+        Pin::new(&mut reader).prepare(24);
+        let start = reader.buffer().as_ptr();
+        while reader.buffer().len() < 24 {
+            reader.force_fill().await.unwrap();
+        }
+        assert_eq!(reader.buffer().as_ptr(), start);
+    }
+
+    /// Holding each force fill's result while reading more, as the NAR
+    /// parser does, shares the buffer. Growing it must still double it
+    /// rather than copy everything on every read.
+    #[tokio::test]
+    async fn test_shared_buffer_grows_geometrically() {
+        let data = Bytes::from(vec![7; 1 << 20]);
+        let source = Chunked {
+            data: data.clone(),
+            chunk: 1024,
+        };
+        let mut reader = BytesReader::builder()
+            .set_reserved_buf_size(1024)
+            .set_max_buf_size(4 << 20)
+            .build(source);
+
+        let mut buf = reader.force_fill().await.unwrap();
+        let mut copies = 0;
+        while buf.len() < data.len() {
+            let before = buf.as_ptr();
+            buf = reader.force_fill().await.unwrap();
+            copies += usize::from(buf.as_ptr() != before);
+        }
+        assert_eq!(buf, data);
+        assert!(copies <= 12, "copied the buffer {copies} times");
+    }
+
+    /// The buffer grows to `max_buf_size` and no further, even when doubling
+    /// would go past it.
+    #[tokio::test]
+    async fn test_force_fill_up_to_max_buf_size() {
+        let data = Bytes::from(vec![7; 48 * 1024]);
+        let source = Chunked {
+            data: data.clone(),
+            chunk: 4096,
+        };
+        let mut reader = BytesReader::builder()
+            .set_max_buf_size(data.len())
+            .build(source);
+
+        while reader.buffer().len() < data.len() {
+            reader.force_fill().await.unwrap();
+        }
+        assert_eq!(reader.buffer(), &data[..]);
+        assert_eq!(reader.buffer_capacity(), data.len());
+        let err = reader.force_fill().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[tokio::test]
     async fn test_force_fill() {
         let mock = Builder::new()
@@ -489,5 +570,28 @@ mod unittests {
             .await;
 
         assert_eq!(std::io::ErrorKind::UnexpectedEof, ret.unwrap_err().kind());
+    }
+
+    /// A string that fits in `max_buf_size` can be read, even when there is
+    /// no room left for a full `reserved_buf_size` after it.
+    #[tokio::test]
+    async fn test_try_read_bytes_up_to_max_buf_size() {
+        let len = 60 * 1024;
+        let mut data = (len as u64).to_le_bytes().to_vec();
+        data.resize(8 + len, 7);
+        let source = Chunked {
+            data: data.into(),
+            chunk: 4096,
+        };
+        let mut reader = BytesReader::builder()
+            .set_max_buf_size(64 * 1024)
+            .build(source);
+
+        let read = TryReadBytesLimited::new(0..=len)
+            .read(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, vec![7; len]);
     }
 }
