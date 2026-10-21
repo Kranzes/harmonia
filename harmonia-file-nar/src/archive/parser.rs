@@ -13,8 +13,8 @@ use crate::padded_reader::{PaddedReader, check_padding};
 use crate::wire::calc_aligned;
 use harmonia_utils_io::{AsyncBufReadCompat, AsyncBytesRead, BytesReader, Lending, LentReader};
 
-use super::NarEvent;
 use super::read_nar::{Inner, InnerState, NodeType};
+use super::{NarEvent, is_valid_entry_name};
 
 // Cap fully-buffered length fields so a hostile NAR cannot force unbounded
 // allocation; both well above NAME_MAX/PATH_MAX.
@@ -36,11 +36,9 @@ pin_project! {
     }
 }
 
-/// Reject names that Nix's NAR parser also refuses; unpacking them to disk
-/// would allow path traversal.
+/// Fails on names that [`is_valid_entry_name`] refuses.
 fn validate_entry_name(name: &[u8]) -> io::Result<()> {
-    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
-    {
+    if !is_valid_entry_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "NAR contains invalid file name",
