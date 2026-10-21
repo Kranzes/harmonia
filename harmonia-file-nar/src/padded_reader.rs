@@ -51,7 +51,13 @@ impl<R> PaddedReader<R> {
             reader,
             trailer_size,
             padding: ZEROS,
-            state: State::Content(content),
+            // An empty reader starts in `Eof`. `Content(0)` would still poll
+            // `reader`, and wait for data if `reader` has none buffered.
+            state: if len == 0 {
+                State::Eof
+            } else {
+                State::Content(content)
+            },
         }
     }
     fn remaining_usize(self: Pin<&mut Self>) -> (usize, usize, usize) {

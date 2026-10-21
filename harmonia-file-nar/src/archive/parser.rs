@@ -335,4 +335,30 @@ mod unittests {
         let actual = read_nar(Cursor::new(contents)).await.unwrap();
         assert_eq!(events, actual);
     }
+
+    /// An empty file's reader ends without reading, so it doesn't wait for
+    /// NAR bytes that haven't arrived yet.
+    #[tokio::test]
+    async fn empty_file_does_not_wait() {
+        use futures_util::{FutureExt as _, StreamExt as _, stream};
+        use tokio::io::AsyncReadExt as _;
+        use tokio_util::io::StreamReader;
+
+        use crate::archive::read_nar::TOK_FILE;
+
+        // A NAR of an empty file, up to its closing ")".
+        let head = Bytes::from([TOK_ROOT, TOK_FILE, &0u64.to_le_bytes()].concat());
+        let source = stream::iter([Ok::<_, io::Error>(head)]).chain(stream::pending());
+        let mut events = std::pin::pin!(parse_nar(StreamReader::new(source)));
+        let Some(Ok(NarEvent::File {
+            size: 0,
+            mut reader,
+            ..
+        })) = events.next().await
+        else {
+            panic!("expected an empty file");
+        };
+        let read = reader.read_to_end(&mut Vec::new()).now_or_never();
+        assert_eq!(read.expect("the reader waited").unwrap(), 0);
+    }
 }
