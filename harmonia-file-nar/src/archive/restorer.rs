@@ -13,7 +13,9 @@ use derive_more::Display;
 use futures_core::Stream;
 use nix::errno::Errno;
 use nix::fcntl::{AT_FDCWD, OFlag, openat};
-use nix::sys::stat::{FchmodatFlags, Mode, UtimensatFlags, fchmodat, futimens, mkdirat, utimensat};
+use nix::sys::stat::{
+    FchmodatFlags, Mode, UtimensatFlags, fchmod, fchmodat, fstat, futimens, mkdirat, utimensat,
+};
 use nix::sys::time::TimeSpec;
 use nix::unistd::symlinkat;
 use thiserror::Error;
@@ -455,6 +457,7 @@ fn write(
 ) -> Result<(), NarWriteError> {
     let mut disk = Disk {
         canonical,
+        chmod_files: canonical,
         file: None,
         depth: 0,
         dir: PathBuf::new(),
@@ -519,6 +522,10 @@ fn append((path, file): &mut (PathBuf, File), data: &[u8]) -> Result<(), NarWrit
 struct Disk {
     /// See [`RestoreOptions::canonical`].
     canonical: bool,
+    /// With `canonical`, whether each new file needs an `fchmod` for its
+    /// mode. It stays true unless the root is a directory that kept all of
+    /// 0o555.
+    chmod_files: bool,
     /// The last created file, which [`Op::Write`] appends to.
     file: Option<(PathBuf, File)>,
     /// How many directories are open.
@@ -571,10 +578,13 @@ impl Disk {
                         // `O_EXCL` fails on a symlink too.
                         let flags =
                             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC;
-                        let created = openat(dir, name, flags, Mode::from_bits_truncate(mode))
-                            .map_err(|err| {
-                                NarWriteError::create_file_error(path.clone(), err.into())
-                            })?;
+                        let mode = Mode::from_bits_truncate(mode);
+                        let err =
+                            |err: Errno| NarWriteError::create_file_error(path.clone(), err.into());
+                        let created = openat(dir, name, flags, mode).map_err(err)?;
+                        if self.chmod_files {
+                            fchmod(&created, mode).map_err(err)?;
+                        }
                         append(self.file.insert((path, created.into())), &data)?;
                     }
                     Kind::Directory => {
@@ -585,6 +595,12 @@ impl Disk {
                             let opened =
                                 openat(dir, name, DIR_FLAGS, Mode::empty()).map_err(err)?;
                             self.fds.push(opened);
+                        }
+                        if self.canonical && depth == 0 {
+                            // New entries lose the same mode bits as the
+                            // root, to the umask or to a default ACL.
+                            let kept = fstat(&self.fds[0]).map_err(err)?.st_mode;
+                            self.chmod_files = kept & 0o555 != 0o555;
                         }
                         self.depth += 1;
                         self.dir = path;
@@ -738,14 +754,12 @@ impl RestoreOptions {
     /// restoring it, so that it needs no second pass. Off by default.
     ///
     /// Files get mode 0o555 if executable and 0o444 otherwise, and
-    /// directories get 0o555. Every entry, symlinks included, gets the
-    /// modification time 1 and keeps its access time. A directory gets its
-    /// mode after its last entry, so if a restore fails, the directories it
-    /// finished are already read-only.
-    ///
-    /// Restore creates files with their final mode, so the process umask, or
-    /// a default ACL on the destination, applies to it as to any new file.
-    /// The usual umask, 022, leaves the mode unchanged.
+    /// directories get 0o555, whatever the process umask. Every entry,
+    /// symlinks included, gets the modification time 1 and keeps its access
+    /// time. A directory gets its mode after its last entry, so if a restore
+    /// fails, the directories it finished are already read-only. Restore
+    /// checks the umask once, when it creates the root, so changing the
+    /// umask during a restore can still take bits off files.
     pub fn canonical(mut self, canonical: bool) -> Self {
         self.canonical = canonical;
         self
@@ -782,8 +796,8 @@ where
 
 #[cfg(test)]
 mod unittests {
-    use std::fs::{OpenOptions, Permissions};
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
     use crate::archive::{NarEvent, dump, test_data};
@@ -791,6 +805,11 @@ mod unittests {
     use futures_util::stream::{StreamExt as _, TryStreamExt as _, iter};
     use rstest::rstest;
     use tempfile::Builder;
+
+    /// Held by the tests that change the umask or check the file modes it
+    /// affects. The umask belongs to the whole process, and `cargo test`
+    /// runs tests on threads of one process.
+    static UMASK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     #[rstest]
@@ -809,6 +828,7 @@ mod unittests {
         #[case] events: test_data::TestNarEvents,
         #[values(false, true)] canonical: bool,
     ) {
+        let _umask = UMASK.lock().await;
         let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
         let path = dir.path().join("output");
 
@@ -837,19 +857,6 @@ mod unittests {
     fn check_canonical(path: &Path) {
         use std::os::unix::fs::MetadataExt as _;
 
-        // The umask applies to the files' modes, so find out what it keeps.
-        let probe = path.with_file_name("probe");
-        let kept = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o777)
-            .open(&probe)
-            .and_then(|f| f.metadata())
-            .unwrap()
-            .mode()
-            & 0o777;
-        std::fs::remove_file(probe).unwrap();
-
         for entry in walkdir::WalkDir::new(path).follow_root_links(false) {
             let entry = entry.unwrap();
             let meta = entry.metadata().unwrap();
@@ -860,8 +867,7 @@ mod unittests {
                 assert_eq!(mode, 0o555, "{at:?}");
                 std::fs::set_permissions(at, Permissions::from_mode(0o755)).unwrap();
             } else if meta.is_file() {
-                let canonical = if mode & 0o100 != 0 { 0o555 } else { 0o444 };
-                assert_eq!(mode, canonical & kept, "{at:?}");
+                assert!(matches!(mode, 0o444 | 0o555), "{at:?}: {mode:o}");
             }
         }
     }
@@ -1121,6 +1127,44 @@ mod unittests {
         let err = restore(events, &path).await.unwrap_err();
         assert_eq!(err.path, PathBuf::from("stream"));
         assert!(path.is_dir());
+    }
+
+    /// With `canonical`, the umask doesn't change the modes, whether it
+    /// takes no bits off them, some, or all but the owner's.
+    #[tokio::test]
+    #[rstest]
+    async fn test_restore_canonical_umask(#[values(0o022, 0o011, 0o077)] mask: nix::libc::mode_t) {
+        use nix::sys::stat::umask;
+
+        /// Puts the old umask back, even if the test panics.
+        struct Restore(Mode);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                umask(self.0);
+            }
+        }
+
+        let _umask = UMASK.lock().await;
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        let events = test_data::dir_example();
+        let old = Restore(umask(Mode::from_bits_truncate(mask)));
+        let restored = RestoreOptions::new()
+            .canonical(true)
+            .restore(iter(events.clone()).map(Ok::<_, NarWriteError>), &path)
+            .await;
+        drop(old);
+        restored.unwrap();
+
+        // The dump shows which files are executable; `check_canonical` only
+        // checks that each mode is canonical.
+        let dumped = dump(&path)
+            .and_then(NarEvent::read_file)
+            .try_collect::<test_data::TestNarEvents>()
+            .await
+            .unwrap();
+        assert_eq!(dumped, events);
+        check_canonical(&path);
     }
 
     /// With `canonical`, a directory that ended is read-only even if the
