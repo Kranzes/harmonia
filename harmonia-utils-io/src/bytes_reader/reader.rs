@@ -594,4 +594,31 @@ mod unittests {
             .unwrap();
         assert_eq!(read, vec![7; len]);
     }
+
+    /// `TryReadBytesLimited` must release the reader's buffer before reading
+    /// the rest of a string, so the reader can move the part already read to
+    /// the front of its buffer instead of copying it to a new one.
+    #[tokio::test]
+    async fn test_try_read_bytes_reuses_buffer() {
+        let mock = Builder::new()
+            .read(&hex!("0C00 0000 0000 0000 0102 0304"))
+            .read(&hex!("0506 0708 090A 0B0C 0000 0000"))
+            .build();
+        // The 16-byte padded string fits in the 16-byte buffer, but
+        // `max_buf_size` leaves no room to also reserve 8 bytes after it, so
+        // `prepare` reserves nothing and reading the rest has to make room.
+        let mut reader = BytesReader::builder()
+            .set_reserved_buf_size(8)
+            .set_max_buf_size(20)
+            .build(mock);
+        let start = reader.buffer().as_ptr();
+
+        let read = TryReadBytesLimited::new(0..=20)
+            .read(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, hex!("0102 0304 0506 0708 090A 0B0C")[..]);
+        assert_eq!(read.as_ptr(), start);
+    }
 }
