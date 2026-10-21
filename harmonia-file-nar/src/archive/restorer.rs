@@ -1,21 +1,21 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{File, OpenOptions, Permissions};
+use std::fs::File;
 use std::io::{self, Write as _};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use derive_more::Display;
 use futures_core::Stream;
-use nix::fcntl::AT_FDCWD;
-use nix::sys::stat::{UtimensatFlags, futimens, utimensat};
+use nix::errno::Errno;
+use nix::fcntl::{AT_FDCWD, OFlag, openat};
+use nix::sys::stat::{FchmodatFlags, Mode, UtimensatFlags, fchmodat, futimens, mkdirat, utimensat};
 use nix::sys::time::TimeSpec;
+use nix::unistd::symlinkat;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncReadExt as _};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -167,6 +167,9 @@ impl NarRestorer {
     where
         R: AsyncBufRead + Unpin,
     {
+        // The number of directories open around the event's entry, before
+        // `check_event` counts a directory it starts or ends.
+        let depth = self.depth;
         self.check_event(&event)?;
         match event {
             NarEvent::File {
@@ -230,12 +233,13 @@ impl NarRestorer {
                         .acquire_many_owned(chunk.len() as u32)
                         .await
                         .expect("the semaphore is never closed");
-                    // `Op::CreateFile` carries the first chunk, even an empty
-                    // one, so a small file takes one op.
+                    // The op that creates the file also carries the first
+                    // chunk, even an empty one, so a small file takes one op.
                     let op = if created {
                         Op::Write(chunk, permit)
                     } else {
-                        Op::CreateFile(self.path.clone(), executable, chunk, permit)
+                        let file = Kind::File(executable, chunk, permit);
+                        Op::Create(depth, self.path.clone(), file)
                     };
                     writer.send(op).await?;
                     created = true;
@@ -252,8 +256,9 @@ impl NarRestorer {
                     name
                 };
 
+                let path = join_name(&self.path, &name);
                 writer
-                    .send(Op::CreateSymlink(join_name(&self.path, &name), target))
+                    .send(Op::Create(depth, path, Kind::Symlink(target)))
                     .await?;
             }
             NarEvent::StartDirectory { name } => {
@@ -271,7 +276,10 @@ impl NarRestorer {
                 if !name.is_empty() {
                     self.path.push(OsStr::from_bytes(&name));
                 }
-                writer.send(Op::CreateDirectory(self.path.clone())).await?;
+                let path = self.path.clone();
+                writer
+                    .send(Op::Create(depth, path, Kind::Directory))
+                    .await?;
             }
             NarEvent::EndDirectory => {
                 if self.use_case_hack {
@@ -281,9 +289,6 @@ impl NarRestorer {
                 // that error messages show.
                 if self.depth > 0 {
                     self.path.pop();
-                }
-                if self.canonical {
-                    writer.send(Op::EndDirectory).await?;
                 }
             }
         }
@@ -319,12 +324,18 @@ impl NarRestorer {
         let sent = async {
             // This future owns `writer`, so the queue closes when it finishes.
             let writer = writer;
-            futures_util::pin_mut!(stream);
-            while let Some(item) = stream.next().await {
-                let event = item.into()?;
-                self.process_event(event, &writer).await?;
+            let sent = async {
+                futures_util::pin_mut!(stream);
+                while let Some(item) = stream.next().await {
+                    self.process_event(item.into()?, &writer).await?;
+                }
+                Ok::<_, NarWriteError>(())
             }
-            Ok(())
+            .await;
+            // The directories that ended after the last entry end now, even
+            // after an error, as if each had ended right away.
+            let ended = writer.send(Op::EndDirectories(self.depth)).await;
+            sent.and(ended)
         };
         futures_util::pin_mut!(sent);
         // Locals drop in reverse order, so if the caller drops the future,
@@ -360,6 +371,20 @@ fn join_name(dir: &Path, name: &[u8]) -> PathBuf {
     path
 }
 
+/// Returns the last `count` names in `path`, or all of `path` if it has
+/// fewer. Restore joins names with single slashes, and names have none.
+fn last_names(path: &Path, count: usize) -> &[u8] {
+    let path = path.as_os_str().as_bytes();
+    let (mut start, mut end) = (0, path.len());
+    for _ in 0..count {
+        let Some(slash) = path[..end].iter().rposition(|&b| b == b'/') else {
+            return path;
+        };
+        (start, end) = (slash + 1, slash);
+    }
+    &path[start..]
+}
+
 /// Cuts `path` back to its first `len` bytes. Unlike [`PathBuf::pop`], it
 /// doesn't parse the path.
 fn truncate_path(path: &mut PathBuf, len: usize) {
@@ -383,16 +408,24 @@ const DATA_IN_FLIGHT: usize = 8 * FILE_CHUNK_SIZE;
 
 /// Filesystem work for the writer thread, in NAR order.
 enum Op {
-    CreateDirectory(PathBuf),
-    CreateSymlink(PathBuf, Bytes),
-    /// Creates a file and writes its first chunk of data.
-    CreateFile(PathBuf, bool, Vec<u8>, OwnedSemaphorePermit),
+    /// Creates the entry at the path, which has the given number of
+    /// directories open around it. Any open directory deeper than that has
+    /// ended, so the writer thread ends it first. That saves an op per
+    /// directory.
+    Create(usize, PathBuf, Kind),
     /// More data for the last created file. The permit is its share of
     /// [`DATA_IN_FLIGHT`].
     Write(Vec<u8>, OwnedSemaphorePermit),
-    /// Ends the innermost open directory. Restores send it only with
-    /// [`RestoreOptions::canonical`].
-    EndDirectory,
+    /// Ends the open directories deeper than this. `restore` sends it last.
+    EndDirectories(usize),
+}
+
+/// What [`Op::Create`] creates.
+enum Kind {
+    Directory,
+    Symlink(Bytes),
+    /// A file, whether it is executable, and its first chunk of data.
+    File(bool, Vec<u8>, OwnedSemaphorePermit),
 }
 
 /// The queue to the writer thread, and the budget for the file data in it.
@@ -413,8 +446,8 @@ impl Writer {
     }
 }
 
-/// Does the filesystem work in `ops`, in order, with `std::fs`. If `dropped`
-/// is cancelled, it returns before the next entry and skips the rest.
+/// Does the filesystem work in `ops`, in order. If `dropped` is cancelled,
+/// it returns before the next entry and skips the rest.
 fn write(
     mut ops: mpsc::Receiver<Op>,
     dropped: &CancellationToken,
@@ -423,7 +456,9 @@ fn write(
     let mut disk = Disk {
         canonical,
         file: None,
-        dirs: Vec::new(),
+        depth: 0,
+        dir: PathBuf::new(),
+        fds: Vec::new(),
     };
     let mut batch = Vec::with_capacity(OPS_PER_BATCH);
     while ops.blocking_recv_many(&mut batch, OPS_PER_BATCH) > 0 {
@@ -442,16 +477,36 @@ fn write(
 /// The modification time Nix gives everything in the store.
 const CANONICAL_MTIME: TimeSpec = TimeSpec::new(1, 0);
 
-/// Sets the modification time of `path` to [`CANONICAL_MTIME`]. If `path`
-/// is a symlink, it sets the symlink's own.
-fn set_canonical_mtime(path: &Path) -> io::Result<()> {
-    Ok(utimensat(
-        AT_FDCWD,
-        path,
+/// How the writer thread opens each directory it creates, to create the
+/// directory's entries relative to it. `O_NOFOLLOW` makes sure that is the
+/// new directory, not a symlink that replaced it. On Linux, `O_PATH` needs
+/// no read permission. Landlock rules that only allow creating entries, like
+/// nix-store-csi's, don't grant it. Elsewhere the directory is opened
+/// read-only.
+const DIR_FLAGS: OFlag = {
+    let flags = OFlag::O_DIRECTORY
+        .union(OFlag::O_NOFOLLOW)
+        .union(OFlag::O_CLOEXEC);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = flags.union(OFlag::O_PATH);
+    flags
+};
+
+/// How many open directories the writer thread keeps a descriptor for. It
+/// creates deeper entries by their path below the deepest of these, so a
+/// deeply nested NAR can't use up the process's descriptors.
+const DIR_FDS: usize = 64;
+
+/// Sets the modification time of entry `name` in `dir` to
+/// [`CANONICAL_MTIME`]. If the entry is a symlink, it sets the symlink's own.
+fn set_canonical_mtime(dir: BorrowedFd<'_>, name: &OsStr) -> Result<(), Errno> {
+    utimensat(
+        dir,
+        name,
         &TimeSpec::UTIME_OMIT,
         &CANONICAL_MTIME,
         UtimensatFlags::NoFollowSymlink,
-    )?)
+    )
 }
 
 /// Appends `data` to the file at `path`.
@@ -466,11 +521,28 @@ struct Disk {
     canonical: bool,
     /// The last created file, which [`Op::Write`] appends to.
     file: Option<(PathBuf, File)>,
-    /// With `canonical`, the paths of the open directories, innermost last.
-    dirs: Vec<PathBuf>,
+    /// How many directories are open.
+    depth: usize,
+    /// The path of the innermost open directory.
+    dir: PathBuf,
+    /// The outermost open directories, at most [`DIR_FDS`] of them.
+    fds: Vec<OwnedFd>,
 }
 
 impl Disk {
+    /// Returns the directory that the entry at `path` goes in, and the
+    /// entry's path there: the innermost open directory and the entry's
+    /// name, unless the entry is more than [`DIR_FDS`] directories deep.
+    /// Only the root comes before any directory is open, and it goes at
+    /// `path` itself.
+    fn locate<'a>(&'a self, path: &'a Path) -> (BorrowedFd<'a>, &'a OsStr) {
+        let Some(dir) = self.fds.last() else {
+            return (AT_FDCWD, path.as_os_str());
+        };
+        let below = last_names(path, self.depth - self.fds.len() + 1);
+        (dir.as_fd(), OsStr::from_bytes(below))
+    }
+
     /// Does the filesystem work for one `op`.
     fn apply(&mut self, op: Op) -> Result<(), NarWriteError> {
         match op {
@@ -480,49 +552,98 @@ impl Disk {
                     &data,
                 )?;
             }
-            Op::CreateFile(path, executable, data, _permit) => {
-                self.close_file()?;
-                trace!("Writing to file {:?}", path);
-                let mut mode = if executable { 0o777 } else { 0o666 };
-                if self.canonical {
-                    // The mode only applies to later opens, so this one can
-                    // still write the file.
-                    mode &= !0o222;
+            Op::Create(depth, path, kind) => {
+                self.end_directories(depth)?;
+                debug_assert_eq!(
+                    self.depth, depth,
+                    "the directories around {path:?} are open"
+                );
+                let (dir, name) = self.locate(&path);
+                match kind {
+                    Kind::File(executable, data, _permit) => {
+                        trace!("Writing to file {:?}", path);
+                        let mut mode = if executable { 0o777 } else { 0o666 };
+                        if self.canonical {
+                            // The mode only applies to later opens, so this
+                            // one can still write the file.
+                            mode &= !0o222;
+                        }
+                        // `O_EXCL` fails on a symlink too.
+                        let flags =
+                            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC;
+                        let created = openat(dir, name, flags, Mode::from_bits_truncate(mode))
+                            .map_err(|err| {
+                                NarWriteError::create_file_error(path.clone(), err.into())
+                            })?;
+                        append(self.file.insert((path, created.into())), &data)?;
+                    }
+                    Kind::Directory => {
+                        let err =
+                            |err: Errno| NarWriteError::create_dir_error(path.clone(), err.into());
+                        mkdirat(dir, name, Mode::from_bits_truncate(0o777)).map_err(err)?;
+                        if self.fds.len() < DIR_FDS {
+                            let opened =
+                                openat(dir, name, DIR_FLAGS, Mode::empty()).map_err(err)?;
+                            self.fds.push(opened);
+                        }
+                        self.depth += 1;
+                        self.dir = path;
+                    }
+                    Kind::Symlink(target) => {
+                        let err = |err: Errno| {
+                            NarWriteError::create_symlink_error(path.clone(), err.into())
+                        };
+                        symlinkat(OsStr::from_bytes(&target), dir, name).map_err(err)?;
+                        if self.canonical {
+                            set_canonical_mtime(dir, name).map_err(err)?;
+                        }
+                    }
                 }
-                let mut options = OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                options.mode(mode);
-                let created = options
-                    .open(&path)
-                    .map_err(|err| NarWriteError::create_file_error(path.clone(), err))?;
-                append(self.file.insert((path, created)), &data)?;
             }
-            Op::CreateDirectory(path) => {
-                self.close_file()?;
-                std::fs::create_dir(&path)
-                    .map_err(|err| NarWriteError::create_dir_error(path.clone(), err))?;
-                if self.canonical {
-                    self.dirs.push(path);
-                }
-            }
-            Op::CreateSymlink(path, target) => {
-                self.close_file()?;
-                let err = |err| NarWriteError::create_symlink_error(path.clone(), err);
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(OsStr::from_bytes(&target), &path).map_err(err)?;
-                if self.canonical {
-                    set_canonical_mtime(&path).map_err(err)?;
-                }
-            }
-            Op::EndDirectory => {
-                self.close_file()?;
-                let path = self.dirs.pop().expect("a directory ends after it starts");
+            Op::EndDirectories(depth) => self.end_directories(depth)?,
+        }
+        Ok(())
+    }
+
+    /// Closes the last created file and ends the open directories deeper
+    /// than `depth`.
+    fn end_directories(&mut self, depth: usize) -> Result<(), NarWriteError> {
+        self.close_file()?;
+        while self.depth > depth {
+            self.depth -= 1;
+            if self.canonical {
                 // All its entries are restored, so it can be read-only now.
-                std::fs::set_permissions(&path, Permissions::from_mode(0o555))
-                    .and_then(|()| set_canonical_mtime(&path))
-                    .map_err(|err| NarWriteError::create_dir_error(path, err))?;
+                // `fchmod` fails on an `O_PATH` descriptor, but `.` below it
+                // is the directory and can't be a symlink. So this needs no
+                // `AT_SYMLINK_NOFOLLOW`, which libc emulates through /proc
+                // before Linux 6.6. A directory deeper than `DIR_FDS` gets a
+                // descriptor just for this.
+                let err =
+                    |err: Errno| NarWriteError::create_dir_error(self.dir.clone(), err.into());
+                let opened;
+                let dir = match self.fds.get(self.depth) {
+                    Some(dir) => dir.as_fd(),
+                    None => {
+                        let (parent, name) = self.locate(&self.dir);
+                        opened = openat(parent, name, DIR_FLAGS, Mode::empty()).map_err(err)?;
+                        opened.as_fd()
+                    }
+                };
+                let here = OsStr::new(".");
+                fchmodat(
+                    dir,
+                    here,
+                    Mode::from_bits_truncate(0o555),
+                    FchmodatFlags::FollowSymlink,
+                )
+                .and_then(|()| set_canonical_mtime(dir, here))
+                .map_err(err)?;
             }
+            self.fds.truncate(self.depth);
+            // Its parent is the innermost open directory now.
+            let name = last_names(&self.dir, 1).len();
+            let parent = self.dir.as_os_str().len() - name;
+            truncate_path(&mut self.dir, parent.saturating_sub(1));
         }
         Ok(())
     }
@@ -661,6 +782,9 @@ where
 
 #[cfg(test)]
 mod unittests {
+    use std::fs::{OpenOptions, Permissions};
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
     use super::*;
     use crate::archive::{NarEvent, dump, test_data};
     use futures_util::FutureExt as _;
@@ -680,6 +804,7 @@ mod unittests {
     #[case::dir_example(test_data::dir_example())]
     #[case::case_hack_sorting(test_data::case_hack_sorting())]
     #[case::many_files(many_files())]
+    #[case::deep_dirs(deep_dirs())]
     async fn test_restore(
         #[case] events: test_data::TestNarEvents,
         #[values(false, true)] canonical: bool,
@@ -782,6 +907,17 @@ mod unittests {
             .collect()
     }
 
+    /// Events for directories nested deeper than the writer thread keeps
+    /// descriptors for, with a file and a symlink at the bottom.
+    fn deep_dirs() -> test_data::TestNarEvents {
+        let depth = DIR_FDS + 2;
+        let mut events = vec![start_dir(b"")];
+        events.extend((0..depth).map(|_| start_dir(b"d")));
+        events.extend([file(b"f"), symlink(b"l")]);
+        events.extend((0..=depth).map(|_| NarEvent::EndDirectory));
+        events
+    }
+
     /// `restore` doesn't trust its input: whatever the stream says, nothing
     /// may be created outside the destination. The error names the entry
     /// inside the destination, or the destination itself.
@@ -863,6 +999,55 @@ mod unittests {
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 
+    /// Restore creates each entry in the directory it created, so replacing
+    /// that directory with a symlink doesn't send later entries, or the
+    /// canonical mode, through the symlink.
+    #[tokio::test]
+    #[rstest]
+    async fn test_restore_keeps_its_directories(#[values(false, true)] canonical: bool) {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode();
+        let path = dir.path().join("output");
+        let swap = {
+            let (sub, outside) = (path.join("sub"), outside.clone());
+            async move {
+                while !sub.exists() {
+                    tokio::task::yield_now().await;
+                }
+                std::fs::rename(&sub, sub.with_file_name("moved")).unwrap();
+                std::os::unix::fs::symlink(outside, &sub).unwrap();
+                None
+            }
+        };
+        let events = iter([start_dir(b""), start_dir(b"sub")])
+            .chain(futures_util::stream::once(swap).filter_map(std::future::ready))
+            .chain(iter([
+                file(b"f"),
+                NarEvent::EndDirectory,
+                NarEvent::EndDirectory,
+            ]));
+
+        // Depending on whether the swap comes before or after restore opens
+        // `sub`, restore may fail, but it must not write outside.
+        let _ = RestoreOptions::new()
+            .canonical(canonical)
+            .restore(events.map(Ok::<_, NarWriteError>), &path)
+            .await;
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let after = std::fs::metadata(&outside).unwrap().permissions().mode();
+        assert_eq!(after, mode);
+
+        // Restore may have made its directories read-only, `moved` included.
+        for entry in walkdir::WalkDir::new(&path) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_dir() {
+                std::fs::set_permissions(entry.path(), Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_restore_file_bigger_than_queue() {
         let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
@@ -936,6 +1121,37 @@ mod unittests {
         let err = restore(events, &path).await.unwrap_err();
         assert_eq!(err.path, PathBuf::from("stream"));
         assert!(path.is_dir());
+    }
+
+    /// With `canonical`, a directory that ended is read-only even if the
+    /// restore fails before the next entry.
+    #[tokio::test]
+    async fn test_restore_canonical_after_error() {
+        let dir = Builder::new().prefix("test_restore").tempdir().unwrap();
+        let path = dir.path().join("output");
+        let failed = NarWriteError::create_file_error("stream".into(), io::ErrorKind::Other.into());
+        let events = [
+            start_dir(b""),
+            start_dir(b"done"),
+            file(b"f"),
+            NarEvent::EndDirectory,
+        ];
+        let events = iter(events.map(Ok)).chain(futures_util::stream::once(async { Err(failed) }));
+        let err = RestoreOptions::new()
+            .canonical(true)
+            .restore(events, &path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.path, PathBuf::from("stream"));
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode(&path.join("done")) & 0o777, 0o555);
+        assert_ne!(
+            mode(&path) & 0o200,
+            0,
+            "the root is read-only before it ended"
+        );
+        std::fs::set_permissions(path.join("done"), Permissions::from_mode(0o755)).unwrap();
     }
 
     /// A read error names the file being read. For the root, that is the
