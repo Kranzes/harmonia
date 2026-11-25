@@ -1239,6 +1239,7 @@ dependencies = [
  "harmonia-utils-signature",
  "harmonia-utils-test",
  "hex-literal",
+ "memchr",
  "proptest",
  "proptest-derive",
  "rstest",
