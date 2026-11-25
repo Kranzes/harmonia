@@ -31,36 +31,34 @@ use harmonia_store_path::{StorePath, StorePathName};
 
 // ========== BasicDerivation ==========
 
-impl NixSerialize for (StorePath, BasicDerivation) {
+impl NixSerialize for BasicDerivation {
     async fn serialize<W>(&self, mut writer: &mut W) -> Result<(), W::Error>
     where
         W: NixWrite,
     {
-        let (drv_path, drv) = self;
-        writer.write_value(drv_path).await?;
-        writer.write_value(&drv.outputs.len()).await?;
-        for (output_name, output) in drv.outputs.iter() {
+        writer.write_value(&self.outputs.len()).await?;
+        for (output_name, output) in self.outputs.iter() {
             writer.write_value(output_name).await?;
-            write_derivation_output(output, &drv.name, output_name, &mut writer).await?;
+            write_derivation_output(output, &self.name, output_name, &mut writer).await?;
         }
-        writer.write_value(&drv.inputs).await?;
-        writer.write_value(&drv.platform).await?;
-        writer.write_value(&drv.builder).await?;
-        writer.write_value(&drv.args).await?;
+        writer.write_value(&self.inputs).await?;
+        writer.write_value(&self.platform).await?;
+        writer.write_value(&self.builder).await?;
+        writer.write_value(&self.args).await?;
         // The wire format (like ATerm) carries structured attrs as the
         // `__json` env var, not as a separate field. Re-inject it in sorted
-        // key order without cloning `drv.env`.
-        match &drv.structured_attrs {
-            None => writer.write_value(&drv.env).await?,
+        // key order without cloning `self.env`.
+        match &self.structured_attrs {
+            None => writer.write_value(&self.env).await?,
             Some(sa) => {
                 use crate::ser::Error as _;
                 const JSON_KEY: &[u8] = b"__json";
                 let json = serde_json::to_vec(&sa.attrs).map_err(|e| {
                     W::Error::custom(std::format_args!("failed to encode structured attrs: {e}"))
                 })?;
-                let total_len = drv.env.len() + usize::from(!drv.env.contains_key(JSON_KEY));
+                let total_len = self.env.len() + usize::from(!self.env.contains_key(JSON_KEY));
                 writer.write_value(&total_len).await?;
-                for (key, value) in drv
+                for (key, value) in self
                     .env
                     .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(JSON_KEY)))
                 {
@@ -69,7 +67,7 @@ impl NixSerialize for (StorePath, BasicDerivation) {
                 }
                 writer.write_slice(JSON_KEY).await?;
                 writer.write_slice(&json).await?;
-                for (key, value) in drv
+                for (key, value) in self
                     .env
                     .range::<[u8], _>((Bound::Excluded(JSON_KEY), Bound::Unbounded))
                 {
@@ -899,9 +897,8 @@ mod tests {
             .write_number(0)
             .write_number(0)
             .build();
-        mock.write_value(&(path.clone(), drv.clone()))
-            .await
-            .unwrap();
+        mock.write_value(&path).await.unwrap();
+        mock.write_value(&drv).await.unwrap();
 
         let mut buf = Vec::new();
         let mut writer = crate::ser::NixWriter::new(&mut buf);
